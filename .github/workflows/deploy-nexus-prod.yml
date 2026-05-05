@@ -1,0 +1,83 @@
+name: Deploy Sigmatiq Nexus Production
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'models/**'
+      - 'Dockerfile'
+      - 'pyproject.toml'
+
+concurrency:
+  group: nexus-prod-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build and Deploy Nexus
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RESOURCE_GROUP: ${{ vars.NEXUS_RESOURCE_GROUP || 'rg-sig-production' }}
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+      APP_NAME: ${{ vars.NEXUS_APP_NAME || 'sigmatiq-nexus-ca' }}
+      REDIS_HOST_CORE: ${{ vars.REDIS_HOST_CORE || 'redis-ingest-etf-plus-nasdaq-a-prod.redis.cache.windows.net' }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push to ACR
+        run: |
+          ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
+          IMAGE_TAG="${GITHUB_SHA::12}"
+          
+          # Use 'az acr build' to build in the cloud without needing Docker locally
+          az acr build \
+            --registry "$ACR_NAME" \
+            --image "sigmatiq-nexus:${IMAGE_TAG}" \
+            --image "sigmatiq-nexus:latest" \
+            --file Dockerfile \
+            .
+            
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE_NAME=${ACR_LOGIN_SERVER}/sigmatiq-nexus:${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+      - name: Deploy to Container App
+        run: |
+          CORE_REDIS_NAME="${REDIS_HOST_CORE%%.redis.cache.windows.net}"
+          
+          # Fetch Redis Key dynamically
+          if CORE_REDIS_KEY="$(az redis list-keys --name "$CORE_REDIS_NAME" --resource-group "$RESOURCE_GROUP" --query primaryKey -o tsv 2>/dev/null)"; then
+            CORE_REDIS_CONN_STRING="redis://${CORE_REDIS_HOST}:6380,password=${CORE_REDIS_KEY},ssl=True,abortConnect=False"
+          else
+            echo "::warning::Could not resolve Redis primary key; using existing env if present."
+          fi
+
+          # Update the Container App
+          # 1. Update Secrets
+          if [ -n "$CORE_REDIS_CONN_STRING" ]; then
+            az containerapp secret set \
+              --name "$APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --secrets "redis-url=${CORE_REDIS_CONN_STRING}"
+          fi
+
+          # 2. Update Image and Env
+          az containerapp update \
+            --name "$APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$IMAGE_NAME" \
+            --set-env-vars "REDIS_URL=secretref:redis-url" "IMAGE_TAG=${IMAGE_TAG}"
