@@ -7,15 +7,18 @@ from collections import deque
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 
+import msgpack
 import numpy as np
 import onnxruntime as ort
 import polars as pl
 import redis.asyncio as redis
+from redis.asyncio.cluster import RedisCluster
 
 # --- CONFIGURATION ---
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-INPUT_STREAM = os.environ.get("NEXUS_INPUT_STREAM", "md:options:trades")
+REDIS_CLUSTER = os.environ.get("NEXUS_REDIS_CLUSTER", "false").strip().lower() == "true"
 SYMBOLS = {s.strip().upper() for s in os.environ.get("NEXUS_SYMBOLS", "SPY").split(",") if s.strip()}
+INPUT_STREAM = os.environ.get("NEXUS_INPUT_STREAM")
 FIRST_TRIGGER_SCOPE = os.environ.get("NEXUS_FIRST_TRIGGER_SCOPE", "symbol").strip().lower()
 MIN_WINDOW_PREMIUM = float(os.environ.get("NEXUS_MIN_WINDOW_PREMIUM", "200000"))
 SIDE_DOMINANCE = float(os.environ.get("NEXUS_SIDE_DOMINANCE", "2.0"))
@@ -24,6 +27,9 @@ SIDE_DOMINANCE = float(os.environ.get("NEXUS_SIDE_DOMINANCE", "2.0"))
 IV_RANK_KEY_TEMPLATE = os.environ.get("NEXUS_IV_RANK_KEY", "stats:{symbol}:iv_rank")
 ATM_IV_KEY_TEMPLATE = os.environ.get("NEXUS_ATM_IV_KEY", "stats:{symbol}:atm_iv")
 NET_GEX_KEY_TEMPLATE = os.environ.get("NEXUS_NET_GEX_KEY", "stats:{symbol}:net_gex")
+IV_SURFACE_KEY_TEMPLATE = os.environ.get("NEXUS_IV_SURFACE_KEY", "options:live:iv_surface:{symbol}")
+VRP_KEY_TEMPLATE = os.environ.get("NEXUS_VRP_KEY", "options:live:vrp:{symbol}")
+GEX_KEY_TEMPLATE = os.environ.get("NEXUS_GEX_KEY", "options:live:gex:{symbol}")
 
 MODEL_V6_HYBRID = os.environ.get("NEXUS_HYBRID_MODEL", "models/hybrid_spy_v6.onnx")
 SCALER_V6_PATH = os.environ.get("NEXUS_HYBRID_SCALER", "models/hybrid_scaler_v6.npz")
@@ -50,6 +56,58 @@ def parse_event_datetime(payload: dict) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def input_streams() -> dict[str, str]:
+    if INPUT_STREAM:
+        return {INPUT_STREAM: "$"}
+    return {f"md:{symbol}:options:trades": "$" for symbol in sorted(SYMBOLS)}
+
+
+def _option_side_from_raw_symbol(raw_symbol: str | None) -> str | None:
+    if not raw_symbol:
+        return None
+    compact = str(raw_symbol).replace(" ", "").upper()
+    if len(compact) >= 9 and compact[-9] in {"C", "P"}:
+        return compact[-9]
+    for marker in ("C", "P"):
+        if marker in compact[-10:]:
+            return marker
+    return None
+
+
+def normalize_trade_payload(payload: dict) -> dict:
+    raw_symbol = payload.get("raw_symbol") or payload.get("rawSymbol")
+    symbol = payload.get("symbol") or payload.get("underlying")
+    price = float(payload.get("price") or 0.0)
+    size = float(payload.get("size") or payload.get("contracts") or 0.0)
+    ts_utc = payload.get("ts_utc") or payload.get("timestamp")
+    ts_event_ns = payload.get("ts_event_ns")
+    if not ts_utc and ts_event_ns:
+        ts_utc = datetime.fromtimestamp(int(ts_event_ns) / 1_000_000_000, tz=timezone.utc).isoformat()
+
+    return {
+        **payload,
+        "symbol": str(symbol or "").strip().upper(),
+        "raw_symbol": raw_symbol,
+        "ts_utc": ts_utc,
+        "side": str(payload.get("side") or _option_side_from_raw_symbol(raw_symbol) or "").strip().upper(),
+        "premium": float(payload.get("premium") or price * size * 100.0),
+        "is_sweep": bool(payload.get("is_sweep") or payload.get("isSweep") or False),
+        "aggressor": str(payload.get("aggressor") or payload.get("trade_side") or "").strip().upper(),
+    }
+
+
+def decode_stream_entry(data: dict) -> dict:
+    if "payload" in data or b"payload" in data:
+        raw = data.get("payload") or data.get(b"payload")
+        payload = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+        return normalize_trade_payload(payload)
+    if "data" in data or b"data" in data:
+        raw = data.get("data") or data.get(b"data")
+        payload = msgpack.unpackb(raw, raw=False)
+        return normalize_trade_payload(payload)
+    return normalize_trade_payload(data)
 
 
 def ny_session_date(dt_utc: datetime):
@@ -122,21 +180,25 @@ class SigmatiqNexus:
         self.redis = None
 
     async def connect(self):
-        self.redis = await redis.from_url(REDIS_URL, decode_responses=True)
+        if REDIS_CLUSTER:
+            self.redis = RedisCluster.from_url(REDIS_URL, decode_responses=False, ssl_cert_reqs=None)
+        else:
+            self.redis = await redis.from_url(REDIS_URL, decode_responses=False)
         print(f"Connected to Redis at {REDIS_URL}")
 
     async def run(self):
         if not self.redis:
             await self.connect()
-        print(f"Nexus starting. Subscribing to {INPUT_STREAM}...")
+        streams = input_streams()
+        print(f"Nexus starting. Subscribing to {', '.join(streams.keys())}...")
 
-        last_id = "$"
         while True:
             try:
-                replies = await self.redis.xread({INPUT_STREAM: last_id}, count=10, block=1000)
-                for _, messages in replies:
+                replies = await self.redis.xread(streams, count=10, block=1000)
+                for stream, messages in replies:
+                    stream_name = stream.decode("utf-8") if isinstance(stream, bytes) else stream
                     for msg_id, data in messages:
-                        last_id = msg_id
+                        streams[stream_name] = msg_id
                         await self.process_message(data)
             except Exception as e:
                 print(f"Error in main loop: {e}")
@@ -151,7 +213,7 @@ class SigmatiqNexus:
 
     async def process_message(self, data):
         try:
-            payload = json.loads(data["payload"]) if "payload" in data else data
+            payload = decode_stream_entry(data)
             symbol = str(payload["symbol"]).strip().upper()
             if symbol not in SYMBOLS:
                 return
@@ -210,10 +272,45 @@ class SigmatiqNexus:
             await self._publish_final(strategy, symbol, sentiment, 1.0, session_date, slot)
 
     async def get_context(self, symbol: str) -> tuple[float, float, float]:
-        iv_rank = float(await self.redis.get(IV_RANK_KEY_TEMPLATE.format(symbol=symbol)) or 50.0)
-        atm_iv = float(await self.redis.get(ATM_IV_KEY_TEMPLATE.format(symbol=symbol)) or 0.15)
-        net_gex = float(await self.redis.get(NET_GEX_KEY_TEMPLATE.format(symbol=symbol)) or 0.0)
+        iv_rank_raw = await self.redis.get(IV_RANK_KEY_TEMPLATE.format(symbol=symbol))
+        atm_iv_raw = await self.redis.get(ATM_IV_KEY_TEMPLATE.format(symbol=symbol))
+        net_gex_raw = await self.redis.get(NET_GEX_KEY_TEMPLATE.format(symbol=symbol))
+
+        iv_rank = float(iv_rank_raw or 50.0)
+        atm_iv = float(atm_iv_raw or 0.15)
+        net_gex = float(net_gex_raw or 0.0)
+
+        if not atm_iv_raw:
+            atm_iv = await self._context_float(IV_SURFACE_KEY_TEMPLATE.format(symbol=symbol), "atmIv", atm_iv)
+        if not net_gex_raw:
+            net_gex = await self._context_float(GEX_KEY_TEMPLATE.format(symbol=symbol), "netGex", net_gex)
+        if not iv_rank_raw:
+            iv_rank = await self._iv_rank_from_vrp(symbol, iv_rank)
         return iv_rank, atm_iv, net_gex
+
+    async def _context_float(self, key: str, field: str, default: float) -> float:
+        raw = await self.redis.get(key)
+        if not raw:
+            return default
+        try:
+            payload = json.loads(raw)
+            value = payload.get(field)
+            return float(value) if value is not None else default
+        except Exception:
+            return default
+
+    async def _iv_rank_from_vrp(self, symbol: str, default: float) -> float:
+        raw = await self.redis.get(VRP_KEY_TEMPLATE.format(symbol=symbol))
+        if not raw:
+            return default
+        try:
+            payload = json.loads(raw)
+            if payload.get("ivRank") is not None:
+                return float(payload["ivRank"])
+            regime = str(payload.get("vrpRegime") or "").lower()
+            return {"cheap": 20.0, "fair": 50.0, "moderate": 60.0, "rich": 80.0, "elevated": 90.0}.get(regime, default)
+        except Exception:
+            return default
 
     async def calculate_hybrid_heuristic(self, df, symbol, slot: dict):
         iv_rank, atm_iv, net_gex = await self.get_context(symbol)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 
+import msgpack
 import polars as pl
 
 from sigmatiq_nexus import nexus_worker as nw
@@ -58,6 +60,24 @@ def test_window_stats_normalizes_option_side_case():
     assert nw.dominant_side(stats) == "C"
 
 
+def test_decode_msgpack_stream_entry_derives_live_trade_fields():
+    payload = {
+        "underlying": "SPY",
+        "raw_symbol": "SPY   260505P00719000",
+        "price": 1.25,
+        "size": 4,
+        "ts_event_ns": 1_778_012_099_996_787_889,
+    }
+
+    decoded = nw.decode_stream_entry({b"data": msgpack.packb(payload, use_bin_type=True)})
+
+    assert decoded["symbol"] == "SPY"
+    assert decoded["side"] == "P"
+    assert decoded["premium"] == 500.0
+    assert decoded["is_sweep"] is False
+    assert decoded["ts_utc"].startswith("2026-")
+
+
 def test_low_sweep_core_allows_only_research_windows_and_sides():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     call_df = pl.DataFrame([row("2026-05-05T13:35:00Z", "C", 250_000, sweep=False)])
@@ -85,9 +105,13 @@ def test_workflow_uses_configured_redis_host_variable():
     assert "rediss://:" in text
 
 class FakeRedis:
-    def __init__(self):
+    def __init__(self, values=None):
+        self.values = values or {}
         self.sets = []
         self.publishes = []
+
+    async def get(self, key):
+        return self.values.get(key)
 
     async def set(self, key, value):
         self.sets.append((key, value))
@@ -122,3 +146,14 @@ def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
 
     assert calls == ["low"]
     assert len(worker.redis.sets) == 1
+
+
+def test_context_falls_back_to_live_option_keys_when_stats_keys_are_absent():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:iv_surface:SPY": json.dumps({"atmIv": 0.22}),
+        "options:live:gex:SPY": json.dumps({"netGex": -1_500_000_000}),
+        "options:live:vrp:SPY": json.dumps({"vrpRegime": "cheap"}),
+    })
+
+    assert asyncio.run(worker.get_context("SPY")) == (20.0, 0.22, -1_500_000_000.0)

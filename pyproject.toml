@@ -9,6 +9,7 @@ dependencies = [
     "onnxruntime>=1.19",
     "numpy>=1.26",
     "pydantic>=2.8",
+    "msgpack>=1.0",
 ]
 
 [project.scripts]
