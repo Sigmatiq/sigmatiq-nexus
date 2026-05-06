@@ -10,6 +10,7 @@ on:
       - 'models/**'
       - 'Dockerfile'
       - 'pyproject.toml'
+      - '.github/workflows/deploy-nexus-prod.yml'
 
 concurrency:
   group: nexus-prod-deploy
@@ -61,7 +62,8 @@ jobs:
           
           # Fetch Redis Key dynamically
           if CORE_REDIS_KEY="$(az redis list-keys --name "$CORE_REDIS_NAME" --resource-group "$RESOURCE_GROUP" --query primaryKey -o tsv 2>/dev/null)"; then
-            CORE_REDIS_CONN_STRING="redis://${CORE_REDIS_HOST}:6380,password=${CORE_REDIS_KEY},ssl=True,abortConnect=False"
+            ENCODED_CORE_REDIS_KEY="$(CORE_REDIS_KEY="$CORE_REDIS_KEY" python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["CORE_REDIS_KEY"], safe=""))')"
+            CORE_REDIS_CONN_STRING="rediss://:${ENCODED_CORE_REDIS_KEY}@${REDIS_HOST_CORE}:6380/0"
           else
             echo "::warning::Could not resolve Redis primary key; using existing env if present."
           fi
