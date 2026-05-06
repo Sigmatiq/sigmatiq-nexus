@@ -10,11 +10,11 @@ Scope is intentionally limited to implemented Nexus strategies and implemented l
 
 | Strategy | Current role | Main decision window | Core idea |
 |---|---:|---:|---|
-| `spy_confluence_sniper` | Phase 1 primary | 10:00-12:30 ET | Flow plus pricing lag plus momentum alignment. |
-| `spy_open_specialist` | Phase 2 primary | 10:00 ET entry from 09:30-10:00 window | Cheap-call open rule: call premium dominates while IV rank is low. |
-| `spy_low_sweep_core` | Phase 2 compatibility | 10:00-10:30 ET entries | Low-sweep directional flow candidate retained from prior research. |
-| `spy_flow_specialist` | Phase 2 support | 10:30 ET entry from 10:00-10:30 window | Strong option-flow dominance with IV/GEX context. |
-| `spy_momentum_specialist` | Phase 2 support | 11:00 ET entry from 10:30-11:00 window | Underlying persistence plus option-flow confirmation. |
+| `etf_confluence_sniper` | Phase 1 primary | 10:00-12:30 ET | Flow plus pricing lag plus momentum alignment. |
+| `etf_open_specialist` | Phase 2 primary | 10:00 ET entry from 09:30-10:00 window | Cheap-call open rule: call premium dominates while IV rank is low. |
+| `etf_low_sweep_core` | Phase 2 compatibility | 10:00-10:30 ET entries | Low-sweep directional flow candidate retained from prior research. |
+| `etf_flow_specialist` | Phase 2 support | 10:30 ET entry from 10:00-10:30 window | Strong option-flow dominance with IV/GEX context. |
+| `etf_momentum_specialist` | Phase 2 support | 11:00 ET entry from 10:30-11:00 window | Underlying persistence plus option-flow confirmation. |
 
 ## Feature Availability Summary
 
@@ -35,7 +35,7 @@ Scope is intentionally limited to implemented Nexus strategies and implemented l
 
 ## Strategy Feature Requirements
 
-### `spy_open_specialist`
+### `etf_open_specialist`
 
 Required features:
 
@@ -53,7 +53,7 @@ Minimum acceptable live behavior:
 - Requires call premium above `NEXUS_MIN_WINDOW_PREMIUM`, IV rank below `30`, and call premium dominance above `NEXUS_OPEN_CALL_DOMINANCE`.
 - Runtime behavior: Nexus blocks this strategy when IV rank is missing or stale.
 
-### `spy_low_sweep_core`
+### `etf_low_sweep_core`
 
 Required features:
 
@@ -72,7 +72,7 @@ Minimum acceptable live behavior:
 - A feature-quality reason should explain when the strategy is disabled because sweep classification is unavailable.
 - Runtime behavior: Nexus blocks this strategy and emits a stage `0` `BLOCKED` diagnostic when `is_sweep` is missing.
 
-### `spy_flow_specialist`
+### `etf_flow_specialist`
 
 Required features:
 
@@ -93,7 +93,7 @@ Minimum acceptable live behavior:
 - Runtime behavior: Nexus blocks this strategy when aggressor, sweep, delta, gamma, IV rank, ATM IV, or net GEX is missing.
 - Runtime freshness behavior: Nexus also blocks when IV, VRP, GEX, or Greek inputs are stale or have unknown freshness.
 
-### `spy_momentum_specialist`
+### `etf_momentum_specialist`
 
 Required features:
 
@@ -111,7 +111,7 @@ Minimum acceptable live behavior:
 - Runtime behavior: Nexus blocks this strategy when `underlying_mid` or IV rank is missing.
 - Runtime freshness behavior: Nexus also blocks when underlying state or IV context is stale or has unknown freshness.
 
-### `spy_confluence_sniper`
+### `etf_confluence_sniper`
 
 Required features:
 

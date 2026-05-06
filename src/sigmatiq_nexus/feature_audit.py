@@ -29,14 +29,14 @@ class FeatureCheck:
 
 
 STRATEGY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
-    "spy_open_specialist": (
+    "etf_open_specialist": (
         "ts_utc",
         "symbol",
         "side",
         "premium",
         "iv_rank",
     ),
-    "spy_low_sweep_core": (
+    "etf_low_sweep_core": (
         "ts_utc",
         "symbol",
         "raw_symbol",
@@ -44,7 +44,7 @@ STRATEGY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "premium",
         "is_sweep",
     ),
-    "spy_flow_specialist": (
+    "etf_flow_specialist": (
         "ts_utc",
         "symbol",
         "raw_symbol",
@@ -58,7 +58,7 @@ STRATEGY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "atm_iv",
         "net_gex",
     ),
-    "spy_momentum_specialist": (
+    "etf_momentum_specialist": (
         "ts_utc",
         "symbol",
         "side",
@@ -66,7 +66,7 @@ STRATEGY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "underlying_mid",
         "iv_rank",
     ),
-    "spy_confluence_sniper": (
+    "etf_confluence_sniper": (
         "ts_utc",
         "raw_symbol",
         "side",

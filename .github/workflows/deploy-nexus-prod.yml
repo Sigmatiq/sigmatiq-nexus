@@ -81,7 +81,7 @@ jobs:
               --env-vars \
                 "REDIS_URL=secretref:redis-url" \
                 "NEXUS_REDIS_CLUSTER=true" \
-                "NEXUS_SYMBOLS=SPY" \
+                "NEXUS_SYMBOLS=SPY,QQQ" \
                 "IMAGE_TAG=${IMAGE_TAG}"
           else
             az containerapp secret set \
@@ -103,6 +103,6 @@ jobs:
               --set-env-vars \
                 "REDIS_URL=secretref:redis-url" \
                 "NEXUS_REDIS_CLUSTER=true" \
-                "NEXUS_SYMBOLS=SPY" \
+                "NEXUS_SYMBOLS=SPY,QQQ" \
                 "IMAGE_TAG=${IMAGE_TAG}"
           fi

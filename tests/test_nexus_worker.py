@@ -93,11 +93,11 @@ def test_feature_audit_blocks_raw_trade_payload_missing_strategy_fields():
     assert audit["features"]["premium"]["status"] == "derived"
     assert audit["features"]["side"]["status"] == "derived"
     assert audit["features"]["is_sweep"]["status"] == "missing"
-    assert audit["strategies"]["spy_low_sweep_core"]["status"] == "blocked"
-    assert "is_sweep" in audit["strategies"]["spy_low_sweep_core"]["missing"]
-    assert "iv_rank" in audit["strategies"]["spy_open_specialist"]["missing"]
-    assert "delta" in audit["strategies"]["spy_flow_specialist"]["missing"]
-    assert "underlying_mid" in audit["strategies"]["spy_momentum_specialist"]["missing"]
+    assert audit["strategies"]["etf_low_sweep_core"]["status"] == "blocked"
+    assert "is_sweep" in audit["strategies"]["etf_low_sweep_core"]["missing"]
+    assert "iv_rank" in audit["strategies"]["etf_open_specialist"]["missing"]
+    assert "delta" in audit["strategies"]["etf_flow_specialist"]["missing"]
+    assert "underlying_mid" in audit["strategies"]["etf_momentum_specialist"]["missing"]
 
 
 def test_feature_audit_marks_enriched_payload_ready_for_all_strategies():
@@ -145,7 +145,7 @@ def test_feature_audit_blocks_confluence_when_only_trade_price_exists():
 
     audit = fa.audit_payload(payload, {"iv_rank": 24.0, "atm_iv": 0.18, "net_gex": 1_000_000, "asOf": "2026-05-05T14:00:00Z"})
 
-    confluence = audit["strategies"]["spy_confluence_sniper"]
+    confluence = audit["strategies"]["etf_confluence_sniper"]
     assert confluence["status"] == "blocked"
     assert confluence["missing"] == ["option_mid"]
 
@@ -241,7 +241,7 @@ def test_publish_final_appends_live_persistence_event():
     worker.signaled_today = set()
     worker.redis = FakeRedis()
 
-    asyncio.run(worker._publish_final("spy_low_sweep_core", "SPY", "BULLISH", 1.0))
+    asyncio.run(worker._publish_final("etf_low_sweep_core", "SPY", "BULLISH", 1.0))
 
     assert len(worker.redis.sets) == 1
     assert len(worker.redis.xadds) == 1
@@ -249,7 +249,7 @@ def test_publish_final_appends_live_persistence_event():
     assert stream == "live:persistence:events"
     assert fields["redis_key"] == "nexus_live_overlay:SPY"
     payload = json.loads(fields["payload_json"])
-    assert payload["strategy"] == "spy_low_sweep_core"
+    assert payload["strategy"] == "etf_low_sweep_core"
     assert payload["stage"] == 2
     assert payload["decision"] == "BET"
     assert maxlen == 10000
@@ -406,7 +406,7 @@ def test_runtime_gate_accepts_fresh_live_context_for_flow():
     }
     df = pl.DataFrame([nw.normalize_trade_payload(payload)])
 
-    assert asyncio.run(worker._missing_strategy_features("spy_flow_specialist", "SPY", df)) == []
+    assert asyncio.run(worker._missing_strategy_features("etf_flow_specialist", "SPY", df)) == []
 
 
 def test_enrich_trade_payload_uses_equity_context_and_contract_tradability():
@@ -635,7 +635,7 @@ def test_contract_state_can_satisfy_confluence_required_features():
     })
     enriched = asyncio.run(nw.enrich_trade_payload_from_redis(payload, redis))
 
-    assert asyncio.run(worker._missing_strategy_features("spy_confluence_sniper", "SPY", pl.DataFrame([enriched]))) == []
+    assert asyncio.run(worker._missing_strategy_features("etf_confluence_sniper", "SPY", pl.DataFrame([enriched]))) == []
 
 
 def test_runtime_gate_allows_enriched_low_sweep_signal():
@@ -662,7 +662,7 @@ def test_runtime_gate_allows_enriched_low_sweep_signal():
     assert len(worker.redis.sets) == 1
     assert len(worker.redis.xadds) == 2
     final = json.loads(worker.redis.sets[0][1])
-    assert final["strategy"] == "spy_low_sweep_core"
+    assert final["strategy"] == "etf_low_sweep_core"
     assert final["decision"] == "BET"
 
 
@@ -683,7 +683,7 @@ def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
 
     async def open_specialist(df, symbol, slot, session_date):
         calls.append("open")
-        await worker._publish_final("spy_open_specialist", symbol, "BULLISH", 0.95, session_date, slot)
+        await worker._publish_final("etf_open_specialist", symbol, "BULLISH", 0.95, session_date, slot)
 
     async def hybrid(df, symbol, slot, session_date):
         calls.append("hybrid")

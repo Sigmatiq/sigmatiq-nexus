@@ -124,9 +124,9 @@ CONTEXT_TIMESTAMP_FIELDS = (
 )
 FRESH_STATUSES = {"available", "derived", "fallback"}
 STRATEGY_REQUIRED_FEATURES = {
-    "spy_open_specialist": ("ts_utc", "symbol", "side", "premium", "iv_rank"),
-    "spy_low_sweep_core": ("ts_utc", "symbol", "raw_symbol", "side", "premium", "is_sweep"),
-    "spy_flow_specialist": (
+    "etf_open_specialist": ("ts_utc", "symbol", "side", "premium", "iv_rank"),
+    "etf_low_sweep_core": ("ts_utc", "symbol", "raw_symbol", "side", "premium", "is_sweep"),
+    "etf_flow_specialist": (
         "ts_utc",
         "symbol",
         "raw_symbol",
@@ -140,8 +140,8 @@ STRATEGY_REQUIRED_FEATURES = {
         "atm_iv",
         "net_gex",
     ),
-    "spy_momentum_specialist": ("ts_utc", "symbol", "side", "premium", "underlying_mid", "iv_rank"),
-    "spy_confluence_sniper": (
+    "etf_momentum_specialist": ("ts_utc", "symbol", "side", "premium", "underlying_mid", "iv_rank"),
+    "etf_confluence_sniper": (
         "ts_utc",
         "raw_symbol",
         "side",
@@ -765,6 +765,14 @@ class SigmatiqNexus:
         session_date = ny_session_date(event_dt_utc)
         if self.already_signaled(session_date, symbol, "*"):
             return
+
+        # --- GLOBAL QUALITY FILTERS ---
+        iv_rank, _, net_gex = await self.get_context(symbol)
+        if net_gex < -2e9: # Skip deep negative GEX (unstable)
+            return
+        if iv_rank < 10: # Skip options that are too cheap (dead zone)
+            return
+
         slot_df = window_df_for_slot(pl.DataFrame(list(self.buffers[symbol])), slot)
         if slot_df.height == 0:
             return
@@ -943,7 +951,7 @@ class SigmatiqNexus:
         await self._append_persistence_event(symbol, msg)
 
     async def evaluate_confluence_sniper(self, df, symbol, slot: dict, session_date):
-        strategy = "spy_confluence_sniper"
+        strategy = "etf_confluence_sniper"
         if self.already_signaled(session_date, symbol, strategy):
             return
         if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
@@ -1001,7 +1009,7 @@ class SigmatiqNexus:
         return (actual_change - expected_change) / (p_start + 1e-9)
 
     async def evaluate_open_specialist(self, df, symbol, slot: dict, session_date):
-        strategy = "spy_open_specialist"
+        strategy = "etf_open_specialist"
         if self.already_signaled(session_date, symbol, strategy) or slot["entry_label"] != "10:00":
             return
         if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
@@ -1025,7 +1033,7 @@ class SigmatiqNexus:
         return "BULLISH", True
 
     async def evaluate_low_sweep_core(self, df, symbol, slot: dict, session_date):
-        strategy = "spy_low_sweep_core"
+        strategy = "etf_low_sweep_core"
         if self.already_signaled(session_date, symbol, strategy):
             return
         if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
@@ -1049,7 +1057,7 @@ class SigmatiqNexus:
         return None, False
 
     async def evaluate_flow_specialist(self, df, symbol, slot: dict, session_date):
-        strategy = "spy_flow_specialist"
+        strategy = "etf_flow_specialist"
         if self.already_signaled(session_date, symbol, strategy):
             return
         if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
@@ -1076,7 +1084,7 @@ class SigmatiqNexus:
         return None, False
 
     async def evaluate_momentum_specialist(self, df, symbol, slot: dict, session_date):
-        strategy = "spy_momentum_specialist"
+        strategy = "etf_momentum_specialist"
         if self.already_signaled(session_date, symbol, strategy):
             return
         if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
