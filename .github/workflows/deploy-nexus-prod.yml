@@ -81,3 +81,12 @@ jobs:
             --resource-group "$RESOURCE_GROUP" \
             --image "$IMAGE_NAME" \
             --set-env-vars "REDIS_URL=secretref:redis-url" "IMAGE_TAG=${IMAGE_TAG}"
+
+      - name: Validate Nexus Redis overlay publish
+        shell: bash
+        run: |
+          python3 scripts/check_nexus_publish.py \
+            --resource-group "$RESOURCE_GROUP" \
+            --app-name "$APP_NAME" \
+            --symbols "SPY,QQQ,IWM" \
+            --json
