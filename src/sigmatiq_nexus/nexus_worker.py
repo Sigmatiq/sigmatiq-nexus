@@ -18,7 +18,7 @@ from redis.asyncio.cluster import RedisCluster
 # --- CONFIGURATION ---
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 REDIS_CLUSTER = os.environ.get("NEXUS_REDIS_CLUSTER", "false").strip().lower() == "true"
-SYMBOLS = {s.strip().upper() for s in os.environ.get("NEXUS_SYMBOLS", "SPY,QQQ").split(",") if s.strip()}
+SYMBOLS = {s.strip().upper() for s in os.environ.get("NEXUS_SYMBOLS", "SPY,QQQ,IWM").split(",") if s.strip()}
 INPUT_STREAM = os.environ.get("NEXUS_INPUT_STREAM")
 FIRST_TRIGGER_SCOPE = os.environ.get("NEXUS_FIRST_TRIGGER_SCOPE", "etf_group").strip().lower()
 MIN_WINDOW_PREMIUM = float(os.environ.get("NEXUS_MIN_WINDOW_PREMIUM", "200000"))
@@ -667,19 +667,13 @@ async def enrich_trade_payload_from_redis(payload: dict, client) -> dict:
     ]
     equity_context, contract_state, tradability = await asyncio.gather(*tasks)
 
-    enriched = dict(payload)
-    _merge_underlying_context(enriched, equity_context)
-    _merge_contract_payload(enriched, contract_state)
-    _merge_contract_payload(enriched, tradability)
-    return normalize_trade_payload(enriched)
-
-
 class SigmatiqNexus:
     def __init__(self):
         self.buffers = {}
         self.max_buffer = 5000
+        self.active_positions = {} # Tracks {symbol: {'entry_price': float, 'is_guarded': bool, 'side': str}}
 
-        print("Loading Dual-Brain AI (SPY + QQQ)...")
+        print("Loading Triple-ETF Sniper (SPY, QQQ, IWM)...")
         self.session_v6 = ort.InferenceSession(MODEL_V6_PATH)
         scaler_v6 = np.load(SCALER_V6_PATH)
         self.v6_mean = scaler_v6["mean"]
@@ -733,7 +727,7 @@ class SigmatiqNexus:
         print(f"Nexus sniper started. Monitoring {', '.join(streams.keys())}.")
         while True:
             try:
-                replies = await read_input_streams(self.redis, streams)
+                replies = await self.redis.xread(streams, count=10, block=1000)
                 for stream, messages in replies:
                     stream_name = stream.decode("utf-8") if isinstance(stream, bytes) else stream
                     for msg_id, data in messages:
@@ -747,6 +741,7 @@ class SigmatiqNexus:
         current_session_date = ny_session_date(event_dt_utc)
         if current_session_date > self.last_reset_session_date:
             self.signaled_today.clear()
+            self.active_positions.clear()
             self.last_reset_session_date = current_session_date
 
     async def process_message(self, data):
@@ -760,6 +755,24 @@ class SigmatiqNexus:
             event_dt_utc = parse_event_datetime(payload)
             self.reset_if_new_session(event_dt_utc)
 
+            # --- DYNAMIC RISK MANAGEMENT (EXIT MONITORING) ---
+            if symbol in self.active_positions:
+                pos = self.active_positions[symbol]
+                curr_price = float(payload.get("option_mid") or 0.0)
+                if curr_price > 0:
+                    ret = ((curr_price - pos['entry_price']) / pos['entry_price']) * 100
+                    
+                    # 1. Hard Stop
+                    if ret <= -50.0:
+                        await self._publish_liquidate(symbol, "STOP_LOSS", ret)
+                    # 2. Guard Activation
+                    elif not pos['is_guarded'] and ret >= 15.0:
+                        pos['is_guarded'] = True
+                        print(f"🛡️ [GUARD] Breakeven guard activated for {symbol} at +{ret:.1f}%")
+                    # 3. Guard Execution
+                    elif pos['is_guarded'] and ret <= 5.0:
+                        await self._publish_liquidate(symbol, "GUARD_EXIT", ret)
+
             if symbol not in self.buffers:
                 self.buffers[symbol] = deque(maxlen=self.max_buffer)
             self.buffers[symbol].append(payload)
@@ -769,6 +782,15 @@ class SigmatiqNexus:
                 await self.evaluate_strategy(symbol, slot, event_dt_utc)
         except Exception as e:
             print(f"Failed to process: {e}")
+
+    async def _publish_liquidate(self, symbol, reason, ret):
+        msg = {"symbol": symbol, "decision": "LIQUIDATE", "reason": reason, "return_pct": float(ret), "timestamp": datetime.now(timezone.utc).isoformat(), "source": "sigmatiq_nexus"}
+        if symbol in self.active_positions:
+            del self.active_positions[symbol]
+        await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
+        await self._append_persistence_event(symbol, msg)
+        await self.redis.publish("nexus_live_overlay:updates", symbol)
+        print(f"🛑 [LIQUIDATE] {symbol} due to {reason} (Ret: {ret:.2f}%)")
 
     async def evaluate_strategy(self, symbol, slot: dict, event_dt_utc: datetime):
         session_date = ny_session_date(event_dt_utc)
@@ -910,13 +932,6 @@ class SigmatiqNexus:
             return None
         times = [parse_optional_datetime(row.get("ts_utc")) for row in df.to_dicts()]
         times = [dt for dt in times if dt]
-        return max(times) if times else None
-
-    def _window_has_event_feature(self, df: pl.DataFrame, feature: str) -> bool:
-        return self._window_event_feature_status(df, feature) in FRESH_STATUSES
-
-    def _window_event_feature_status(self, df: pl.DataFrame, feature: str) -> str:
-        if df.is_empty():
             return "missing"
         if "_feature_status" in df.columns:
             for row in df.to_dicts():
@@ -959,6 +974,24 @@ class SigmatiqNexus:
         print(f"[BLOCKED] {strategy} for {symbol}: feature gate closed {failures}")
         await self._append_persistence_event(symbol, msg)
 
+    def _get_lead_price(self, df: pl.DataFrame, sentiment: str) -> float:
+        side = "C" if sentiment == "BULLISH" else "P"
+        side_df = df.filter(pl.col("side").cast(pl.Utf8).str.to_uppercase() == side)
+        if side_df.is_empty(): return 0.0
+        lead = side_df.group_by("raw_symbol").agg(pl.col("premium").cast(pl.Float64, strict=False).fill_null(0).sum().alias("tp")).sort("tp", descending=True).head(1)
+        if lead.is_empty(): return 0.0
+        price_col = "option_mid" if "option_mid" in df.columns else "price"
+        return float(side_df.filter(pl.col("raw_symbol") == lead[0, "raw_symbol"]).tail(1).select(pl.col(price_col)).item() or 0.0)
+
+    def _get_lead_price(self, df: pl.DataFrame, sentiment: str) -> float:
+        side = "C" if sentiment == "BULLISH" else "P"
+        side_df = df.filter(pl.col("side").cast(pl.Utf8).str.to_uppercase() == side)
+        if side_df.is_empty(): return 0.0
+        lead = side_df.group_by("raw_symbol").agg(pl.col("premium").cast(pl.Float64, strict=False).fill_null(0).sum().alias("tp")).sort("tp", descending=True).head(1)
+        if lead.is_empty(): return 0.0
+        price_col = "option_mid" if "option_mid" in df.columns else "price"
+        return float(side_df.filter(pl.col("raw_symbol") == lead[0, "raw_symbol"]).tail(1).select(pl.col(price_col)).item() or 0.0)
+
     async def evaluate_confluence_sniper(self, df, symbol, slot: dict, session_date):
         strategy = "etf_confluence_sniper"
         if self.already_signaled(session_date, symbol, strategy):
@@ -971,8 +1004,9 @@ class SigmatiqNexus:
         pricing_lag = self.calculate_pricing_lag(df, sentiment)
         if pricing_lag is None or pricing_lag > -0.05:
             return
+        price = self._get_lead_price(df, sentiment)
         await self._publish_intermediate(strategy, symbol, sentiment, slot)
-        await self._publish_final(strategy, symbol, sentiment, 1.0, session_date, slot)
+        await self._publish_final(strategy, symbol, sentiment, 1.0, price, session_date, slot)
 
     def calculate_pricing_lag(self, df, sentiment: str) -> float | None:
         required = {"ts_utc", "raw_symbol", "underlying_mid", "delta"}
@@ -1025,8 +1059,9 @@ class SigmatiqNexus:
             return
         sentiment, valid = await self.check_open_specialist_heuristic(df, symbol, slot)
         if valid:
+            price = self._get_lead_price(df, sentiment)
             await self._publish_intermediate(strategy, symbol, sentiment, slot)
-            await self._publish_final(strategy, symbol, sentiment, 0.95, session_date, slot)
+            await self._publish_final(strategy, symbol, sentiment, 0.95, price, session_date, slot)
 
     async def check_open_specialist_heuristic(self, df, symbol, slot: dict):
         if slot["entry_label"] != "10:00":
@@ -1049,8 +1084,9 @@ class SigmatiqNexus:
             return
         sentiment, valid = await self.calculate_low_sweep_heuristic(df, slot)
         if valid:
+            price = self._get_lead_price(df, sentiment)
             await self._publish_intermediate(strategy, symbol, sentiment, slot)
-            await self._publish_final(strategy, symbol, sentiment, 1.0, session_date, slot)
+            await self._publish_final(strategy, symbol, sentiment, 1.0, price, session_date, slot)
 
     async def calculate_low_sweep_heuristic(self, df, slot: dict):
         stats = window_stats(df)
@@ -1076,7 +1112,8 @@ class SigmatiqNexus:
             await self._publish_intermediate(strategy, symbol, sentiment, slot)
             prob = await self.predict_v6(df, symbol)
             if prob > 0.45:
-                await self._publish_final(strategy, symbol, sentiment, prob, session_date, slot)
+                price = self._get_lead_price(df, sentiment)
+                await self._publish_final(strategy, symbol, sentiment, prob, price, session_date, slot)
 
     async def check_flow_heuristics(self, df, symbol, slot: dict):
         iv_rank, atm_iv, net_gex = await self.get_context(symbol)
@@ -1103,7 +1140,8 @@ class SigmatiqNexus:
             await self._publish_intermediate(strategy, symbol, sentiment, slot)
             prob = await self.predict_v10(df, symbol, p_feat)
             if prob > 0.55:
-                await self._publish_final(strategy, symbol, sentiment, prob, session_date, slot)
+                price = self._get_lead_price(df, sentiment)
+                await self._publish_final(strategy, symbol, sentiment, prob, price, session_date, slot)
 
     async def check_momentum_heuristics(self, df, symbol):
         if "underlying_mid" not in df.columns:
@@ -1170,8 +1208,8 @@ class SigmatiqNexus:
         await self._append_persistence_event(symbol, msg)
         await self.redis.publish(f"signal:intermediate:{strategy}", json.dumps(msg))
 
-    async def _publish_final(self, strategy: str, symbol: str, sentiment: str, confidence: float, session_date=None, slot: dict | None = None):
-        msg = {"strategy": strategy, "symbol": symbol, "stage": 2, "decision": "BET", "sentiment": sentiment, "confidence": float(confidence), "timestamp": datetime.now(timezone.utc).isoformat(), "source": "sigmatiq_nexus"}
+    async def _publish_final(self, strategy: str, symbol: str, sentiment: str, confidence: float, entry_price: float, session_date=None, slot: dict | None = None):
+        msg = {"strategy": strategy, "symbol": symbol, "stage": 2, "decision": "BET", "sentiment": sentiment, "confidence": float(confidence), "entry_price": entry_price, "timestamp": datetime.now(timezone.utc).isoformat(), "source": "sigmatiq_nexus"}
         if session_date:
             msg["session_date"] = str(session_date)
         if slot:
@@ -1183,10 +1221,15 @@ class SigmatiqNexus:
         elif FIRST_TRIGGER_SCOPE == "etf_group":
             self.signaled_today.add(signal_key(key_date, symbol, "*"))
             self.signaled_today.add(signal_key(key_date, "*", "*"))
+        
+        # Track position for dynamic exit
+        if entry_price > 0:
+            self.active_positions[symbol] = {'entry_price': entry_price, 'is_guarded': False, 'side': sentiment}
+
         await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
         await self._append_persistence_event(symbol, msg)
         await self.redis.publish("nexus_live_overlay:updates", symbol)
-        print(f"[BET] {strategy} for {symbol} (Conf: {confidence:.4f})")
+        print(f"[BET] {strategy} for {symbol} (Conf: {confidence:.4f} @ ${entry_price:.2f})")
 
     async def _append_persistence_event(self, symbol, msg):
         try:
@@ -1198,12 +1241,7 @@ class SigmatiqNexus:
             )
         except Exception as exc:
             print(f"Nexus persistence event append failed for {symbol}: {exc}")
-
-
-def main():
-    nexus = SigmatiqNexus()
-    asyncio.run(nexus.run())
-
-
 if __name__ == "__main__":
-    main()
+            pl.col("is_sweep").cast(pl.Float32, strict=False).fill_null(0.0).alias("sw"),
+        ])
+        seq = feats.to_numpy().astype(np.float32)
