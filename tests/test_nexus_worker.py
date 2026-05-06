@@ -101,8 +101,9 @@ def test_workflow_uses_configured_redis_host_variable():
     text = open(".github/workflows/deploy-nexus-prod.yml", encoding="utf-8").read()
 
     assert "CORE_REDIS_HOST" not in text
-    assert "${REDIS_HOST_CORE}:6380" in text
-    assert "rediss://:" in text
+    assert "SOURCE_REDIS_APP: options-liveworker-prod-ca" in text
+    assert "NEXUS_REDIS_CLUSTER=true" in text
+    assert "NEXUS_SYMBOLS=SPY" in text
 
 class FakeRedis:
     def __init__(self, values=None):
@@ -157,3 +158,23 @@ def test_context_falls_back_to_live_option_keys_when_stats_keys_are_absent():
     })
 
     assert asyncio.run(worker.get_context("SPY")) == (20.0, 0.22, -1_500_000_000.0)
+
+
+def test_momentum_specialist_requires_underlying_mid_and_uses_iv_gate():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({"options:live:vrp:SPY": json.dumps({"vrpRegime": "cheap"})})
+    rows = []
+    for minute in range(10):
+        rows.append({
+            **row(f"2026-05-05T13:{30 + minute:02d}:00Z", "C", 25_000),
+            "underlying_mid": 700.0 + minute,
+        })
+        rows.append({
+            **row(f"2026-05-05T13:{30 + minute:02d}:30Z", "C", 25_000),
+            "underlying_mid": 700.5 + minute,
+        })
+
+    sentiment, valid, p_feat = asyncio.run(worker.check_momentum_heuristics(pl.DataFrame(rows), "SPY"))
+
+    assert (sentiment, valid) == ("BULLISH", True)
+    assert p_feat[:2] == [10.0, 0.0]

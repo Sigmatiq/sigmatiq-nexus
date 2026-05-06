@@ -20,15 +20,16 @@ jobs:
   deploy:
     name: Build and Deploy Nexus
     runs-on: ubuntu-latest
-    environment: prod
     permissions:
       contents: read
       id-token: write
     env:
-      RESOURCE_GROUP: ${{ vars.NEXUS_RESOURCE_GROUP || 'rg-sig-production' }}
-      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
-      APP_NAME: ${{ vars.NEXUS_APP_NAME || 'sigmatiq-nexus-ca' }}
-      REDIS_HOST_CORE: ${{ vars.REDIS_HOST_CORE || 'redis-ingest-etf-plus-nasdaq-a-prod.redis.cache.windows.net' }}
+      RESOURCE_GROUP: rg-sig-production
+      CONTAINER_APPS_ENV: cae-sigmatiq-prod
+      ACR_LOGIN_SERVER: acrsigmatiqprodiotgrj.azurecr.io
+      APP_NAME: sigmatiq-nexus-ca
+      SOURCE_REDIS_APP: options-liveworker-prod-ca
+      SOURCE_REDIS_SECRET: redis-host
 
     steps:
       - uses: actions/checkout@v5
@@ -42,44 +43,72 @@ jobs:
 
       - name: Build and push to ACR
         run: |
+          set -euo pipefail
           ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
           IMAGE_TAG="${GITHUB_SHA::12}"
-          
-          # Use 'az acr build' to build in the cloud without needing Docker locally
+
           az acr build \
             --registry "$ACR_NAME" \
             --image "sigmatiq-nexus:${IMAGE_TAG}" \
             --image "sigmatiq-nexus:latest" \
             --file Dockerfile \
             .
-            
+
           echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
           echo "IMAGE_NAME=${ACR_LOGIN_SERVER}/sigmatiq-nexus:${IMAGE_TAG}" >> "$GITHUB_ENV"
 
-      - name: Deploy to Container App
+      - name: Create or update Container App
         run: |
-          CORE_REDIS_NAME="${REDIS_HOST_CORE%%.redis.cache.windows.net}"
-          
-          # Fetch Redis Key dynamically
-          if CORE_REDIS_KEY="$(az redis list-keys --name "$CORE_REDIS_NAME" --resource-group "$RESOURCE_GROUP" --query primaryKey -o tsv 2>/dev/null)"; then
-            ENCODED_CORE_REDIS_KEY="$(CORE_REDIS_KEY="$CORE_REDIS_KEY" python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["CORE_REDIS_KEY"], safe=""))')"
-            CORE_REDIS_CONN_STRING="rediss://:${ENCODED_CORE_REDIS_KEY}@${REDIS_HOST_CORE}:6380/0"
-          else
-            echo "::warning::Could not resolve Redis primary key; using existing env if present."
-          fi
+          set -euo pipefail
 
-          # Update the Container App
-          # 1. Update Secrets
-          if [ -n "$CORE_REDIS_CONN_STRING" ]; then
+          REDIS_CONN_STRING="$(az containerapp secret show \
+            --name "$SOURCE_REDIS_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --secret-name "$SOURCE_REDIS_SECRET" \
+            --query value -o tsv)"
+          test -n "$REDIS_CONN_STRING"
+
+          ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
+          ACR_USER="$(az acr credential show --name "$ACR_NAME" --query username -o tsv)"
+          ACR_PASS="$(az acr credential show --name "$ACR_NAME" --query passwords[0].value -o tsv)"
+
+          if ! az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
+            az containerapp create \
+              --name "$APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --environment "$CONTAINER_APPS_ENV" \
+              --image "$IMAGE_NAME" \
+              --min-replicas 1 \
+              --max-replicas 1 \
+              --registry-server "$ACR_LOGIN_SERVER" \
+              --registry-username "$ACR_USER" \
+              --registry-password "$ACR_PASS" \
+              --secrets "redis-url=${REDIS_CONN_STRING}" \
+              --env-vars \
+                "REDIS_URL=secretref:redis-url" \
+                "NEXUS_REDIS_CLUSTER=true" \
+                "NEXUS_SYMBOLS=SPY" \
+                "IMAGE_TAG=${IMAGE_TAG}"
+          else
             az containerapp secret set \
               --name "$APP_NAME" \
               --resource-group "$RESOURCE_GROUP" \
-              --secrets "redis-url=${CORE_REDIS_CONN_STRING}"
-          fi
+              --secrets "redis-url=${REDIS_CONN_STRING}"
 
-          # 2. Update Image and Env
-          az containerapp update \
-            --name "$APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --image "$IMAGE_NAME" \
-            --set-env-vars "REDIS_URL=secretref:redis-url" "IMAGE_TAG=${IMAGE_TAG}"
+            az containerapp registry set \
+              --name "$APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --server "$ACR_LOGIN_SERVER" \
+              --username "$ACR_USER" \
+              --password "$ACR_PASS"
+
+            az containerapp update \
+              --name "$APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --image "$IMAGE_NAME" \
+              --set-env-vars \
+                "REDIS_URL=secretref:redis-url" \
+                "NEXUS_REDIS_CLUSTER=true" \
+                "NEXUS_SYMBOLS=SPY" \
+                "IMAGE_TAG=${IMAGE_TAG}"
+          fi
