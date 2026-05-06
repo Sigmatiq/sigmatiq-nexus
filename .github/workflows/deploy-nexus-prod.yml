@@ -24,12 +24,10 @@ jobs:
       contents: read
       id-token: write
     env:
-      RESOURCE_GROUP: rg-sig-production
+      RESOURCE_GROUP: rg-sigmatiq-prod
       CONTAINER_APPS_ENV: cae-sigmatiq-prod
       ACR_LOGIN_SERVER: acrsigmatiqprodiotgrj.azurecr.io
       APP_NAME: sigmatiq-nexus-ca
-      SOURCE_REDIS_APP: options-liveworker-prod-ca
-      SOURCE_REDIS_SECRET: redis-host
 
     steps:
       - uses: actions/checkout@v5
@@ -61,11 +59,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          REDIS_CONN_STRING="$(az containerapp secret show \
-            --name "$SOURCE_REDIS_APP" \
-            --resource-group "$RESOURCE_GROUP" \
-            --secret-name "$SOURCE_REDIS_SECRET" \
-            --query value -o tsv)"
+          REDIS_CONN_STRING="${{ secrets.NEXUS_REDIS_URL }}"
           test -n "$REDIS_CONN_STRING"
 
           ACR_NAME="${ACR_LOGIN_SERVER%%.*}"

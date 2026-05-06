@@ -101,7 +101,8 @@ def test_workflow_uses_configured_redis_host_variable():
     text = open(".github/workflows/deploy-nexus-prod.yml", encoding="utf-8").read()
 
     assert "CORE_REDIS_HOST" not in text
-    assert "SOURCE_REDIS_APP: options-liveworker-prod-ca" in text
+    assert "rg-sigmatiq-prod" in text
+    assert "secrets.NEXUS_REDIS_URL" in text
     assert "NEXUS_REDIS_CLUSTER=true" in text
     assert "NEXUS_SYMBOLS=SPY" in text
 
