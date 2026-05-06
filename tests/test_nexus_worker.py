@@ -242,6 +242,48 @@ class FakeRedis:
         return "1-0"
 
 
+class FakeXReadRedis:
+    def __init__(self):
+        self.calls = []
+
+    async def xread(self, streams, count=None, block=None):
+        self.calls.append((streams, count, block))
+        stream_name = next(iter(streams))
+        return [(stream_name, [(f"{len(self.calls)}-0", {b"data": b"{}"})])]
+
+
+def test_cluster_mode_reads_each_input_stream_separately(monkeypatch):
+    monkeypatch.setattr(nw, "REDIS_CLUSTER", True)
+    redis_client = FakeXReadRedis()
+    streams = {
+        "md:QQQ:options:trades": "$",
+        "md:SPY:options:trades": "$",
+    }
+
+    replies = asyncio.run(nw.read_input_streams(redis_client, streams))
+
+    assert len(redis_client.calls) == 2
+    assert [call[0] for call in redis_client.calls] == [
+        {"md:QQQ:options:trades": "$"},
+        {"md:SPY:options:trades": "$"},
+    ]
+    assert all(call[1:] == (10, 250) for call in redis_client.calls)
+    assert [reply[0] for reply in replies] == ["md:QQQ:options:trades", "md:SPY:options:trades"]
+
+
+def test_non_cluster_mode_uses_single_multi_stream_xread(monkeypatch):
+    monkeypatch.setattr(nw, "REDIS_CLUSTER", False)
+    redis_client = FakeXReadRedis()
+    streams = {
+        "md:QQQ:options:trades": "$",
+        "md:SPY:options:trades": "$",
+    }
+
+    asyncio.run(nw.read_input_streams(redis_client, streams))
+
+    assert redis_client.calls == [(streams, 10, 1000)]
+
+
 def test_publish_final_appends_live_persistence_event():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()

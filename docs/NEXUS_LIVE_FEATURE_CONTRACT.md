@@ -160,6 +160,7 @@ Required fields:
 Current state:
 
 - Raw events exist.
+- Production Redis is clustered, so Nexus consumes `md:{symbol}:options:trades` one stream at a time instead of one multi-key `XREAD`; this avoids Redis Cluster cross-slot failures for the combined SPY/QQQ worker.
 - Options live worker computes enough enrichment internally for unusual-trade logic.
 - Nexus should not assume production raw events include research fields; it now derives `aggressor` and `is_sweep` from fresh contract-state/tradability quotes when raw fields are absent.
 

@@ -26,7 +26,7 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 ## Runtime configuration
 
 - `REDIS_URL`: Redis connection URL used by the worker.
-- `NEXUS_REDIS_CLUSTER`: set to `true` for Azure clustered Redis.
+- `NEXUS_REDIS_CLUSTER`: set to `true` for Azure clustered Redis. In cluster mode Nexus reads each configured input stream separately so Redis does not reject multi-key `XREAD` calls across hash slots.
 - `NEXUS_INPUT_STREAM`: optional explicit Redis stream. If absent, Nexus consumes `md:{symbol}:options:trades`.
 - `NEXUS_SYMBOLS`: comma-separated symbols to process, default `SPY,QQQ`.
 - `NEXUS_IV_RANK_KEY`, `NEXUS_ATM_IV_KEY`, `NEXUS_NET_GEX_KEY`: optional direct Redis key templates for live context, each using `{symbol}`.

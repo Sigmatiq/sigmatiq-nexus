@@ -261,6 +261,15 @@ def input_streams() -> dict[str, str]:
     return {f"md:{symbol}:options:trades": "$" for symbol in sorted(SYMBOLS)}
 
 
+async def read_input_streams(redis_client, streams: dict[str, str]):
+    if REDIS_CLUSTER and len(streams) > 1:
+        replies = []
+        for stream_name, last_id in list(streams.items()):
+            replies.extend(await redis_client.xread({stream_name: last_id}, count=10, block=250))
+        return replies
+    return await redis_client.xread(streams, count=10, block=1000)
+
+
 def signal_key(session_date, symbol: str, strategy: str) -> str:
     if FIRST_TRIGGER_SCOPE == "strategy":
         return f"{session_date}:{symbol}:{strategy}"
@@ -724,7 +733,7 @@ class SigmatiqNexus:
         print(f"Nexus sniper started. Monitoring {', '.join(streams.keys())}.")
         while True:
             try:
-                replies = await self.redis.xread(streams, count=10, block=1000)
+                replies = await read_input_streams(self.redis, streams)
                 for stream, messages in replies:
                     stream_name = stream.decode("utf-8") if isinstance(stream, bytes) else stream
                     for msg_id, data in messages:
