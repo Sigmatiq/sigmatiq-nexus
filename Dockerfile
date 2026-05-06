@@ -8,14 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Optimization: install hiredis for faster redis communication
+# Copy package metadata and source before installing the local package.
 COPY pyproject.toml .
+COPY src/ src/
 RUN pip install --no-cache-dir hatchling && \
     pip install --no-cache-dir .
 
-# Copy models and source
+# Copy models after dependency install so code-only changes reuse dependency layers.
 COPY models/ models/
-COPY src/ src/
 
 # Run as non-privileged user for security
 RUN useradd -m sigmatiq

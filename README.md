@@ -10,6 +10,7 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
    - **Stage 1 (Heuristic):** Uses Polars to calculate Delta-Skew/Aggressor bias in microseconds.
    - **Stage 2 (AI):** Uses ONNX Runtime to validate trajectories with the RL Brain.
 3. **Decisions:** Publishes `BET` or `PASS` results to `signal:final:*` Redis channels.
+4. **Persistence:** Appends final/intermediate signal payloads to `live:persistence:events`; `Sigmatiq.Options.LivePersistenceWorker` stores them in `live.nexus_strategy_signal` for EOD review.
 
 ## Live decision contract
 
@@ -18,6 +19,7 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - First trigger wins by default per `session_date + symbol`, so only one final live overlay is published per symbol per NY session.
 - Set `NEXUS_FIRST_TRIGGER_SCOPE=strategy` only when each strategy is allowed to fire independently.
 - `spy_low_sweep_core` is evaluated before `spy_sharpened_alpha` because it is the research-backed low-sweep candidate.
+- Each strategy now has a fail-closed feature gate. If required live fields are missing, Nexus emits a stage `0` `BLOCKED` diagnostic to `live:persistence:events` and skips the strategy instead of defaulting missing booleans/numbers.
 
 ## Runtime configuration
 
@@ -27,7 +29,35 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - `NEXUS_SYMBOLS`: comma-separated symbols to process, default `SPY`.
 - `NEXUS_IV_RANK_KEY`, `NEXUS_ATM_IV_KEY`, `NEXUS_NET_GEX_KEY`: optional direct Redis key templates for live context, each using `{symbol}`.
 - `NEXUS_IV_SURFACE_KEY`, `NEXUS_VRP_KEY`, `NEXUS_GEX_KEY`: live options-worker fallback key templates, defaulting to `options:live:*:{symbol}` keys.
+- `NEXUS_EQUITY_CONTEXT_KEY`: equity live context key template, default `equity:live:context:{symbol}`.
+- `NEXUS_CONTRACT_TRADABILITY_KEY`: option tradability key template, default `options:live:tradability:{raw_symbol}`.
+- `NEXUS_CONTRACT_STATE_KEY`: per-contract quote plus Greek state key template, default `options:live:contract_state:{raw_symbol}`.
+- `NEXUS_REQUIRE_CONTEXT_TIMESTAMPS`: default `true`; timestamp-less scalar context keys are blocked for live strategy decisions.
+- `NEXUS_VOL_CONTEXT_MAX_AGE_SECONDS`: max IV/VRP context age, default `120`.
+- `NEXUS_GEX_CONTEXT_MAX_AGE_SECONDS`: max GEX context age, default `120`.
+- `NEXUS_UNDERLYING_MAX_AGE_SECONDS`: max underlying state age on enriched events, default `5`.
+- `NEXUS_OPTION_QUOTE_MAX_AGE_SECONDS`: max option quote/mid age on enriched events, default `5`.
+- `NEXUS_GREEK_MAX_AGE_SECONDS`: max Greek age on enriched events, default `60`.
+- `NEXUS_SWEEP_PREMIUM_USD`: quote-derived sweep threshold when raw `is_sweep` is absent, default `25000`.
 - `NEXUS_MIN_WINDOW_PREMIUM` and `NEXUS_SIDE_DOMINANCE`: window-level premium and side-dominance thresholds.
+- `LIVE_PERSISTENCE_EVENT_STREAM`: Redis Stream for durable signal capture, default `live:persistence:events`.
+
+## Feature audit
+
+Before enabling a live strategy, verify the Redis payload shape:
+
+```bash
+nexus-audit-features --symbol SPY --limit 5
+```
+
+The audit reports which implemented strategies are `ready`, `degraded`, or `blocked` based on the sampled trade event plus live IV/GEX context. It also reports `stale` or `unknown_freshness` when a required field exists but cannot be trusted at decision time. The full feature contract is documented in `docs/NEXUS_LIVE_FEATURE_CONTRACT.md`.
+
+At runtime Nexus enriches raw option trade events from:
+
+- `equity:live:context:{symbol}` for `underlying_mid` and spot freshness.
+- `options:live:tradability:{raw_symbol}` for option bid/ask/mid, quote timestamp, spread, and executable/tradability flags.
+- `options:live:contract_state:{raw_symbol}` for option mid, quote quality, tradability flags, underlying spot, and Greeks.
+- If raw trades omit `aggressor` or `is_sweep`, Nexus derives them only from fresh quote state; stale or untradable quotes still block the relevant strategy.
 
 ## Tech Stack
 - **Polars:** Vectorized trade processing.
