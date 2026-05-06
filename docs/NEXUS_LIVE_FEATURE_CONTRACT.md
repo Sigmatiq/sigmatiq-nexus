@@ -11,9 +11,10 @@ Scope is intentionally limited to implemented Nexus strategies and implemented l
 | Strategy | Current role | Main decision window | Core idea |
 |---|---:|---:|---|
 | `spy_confluence_sniper` | Phase 1 primary | 10:00-12:30 ET | Flow plus pricing lag plus momentum alignment. |
-| `spy_low_sweep_core` | Phase 2 primary | 10:00-12:30 ET | Smaller sweep-heavy directional flow with strict time behavior. |
-| `spy_flow_specialist` | Phase 2 support | 10:00-12:30 ET | Strong option-flow dominance with IV/GEX context. |
-| `spy_momentum_specialist` | Phase 2 support | 10:00-12:30 ET | Underlying persistence plus option-flow confirmation. |
+| `spy_open_specialist` | Phase 2 primary | 10:00 ET entry from 09:30-10:00 window | Cheap-call open rule: call premium dominates while IV rank is low. |
+| `spy_low_sweep_core` | Phase 2 compatibility | 10:00-10:30 ET entries | Low-sweep directional flow candidate retained from prior research. |
+| `spy_flow_specialist` | Phase 2 support | 10:30 ET entry from 10:00-10:30 window | Strong option-flow dominance with IV/GEX context. |
+| `spy_momentum_specialist` | Phase 2 support | 11:00 ET entry from 10:30-11:00 window | Underlying persistence plus option-flow confirmation. |
 
 ## Feature Availability Summary
 
@@ -33,6 +34,24 @@ Scope is intentionally limited to implemented Nexus strategies and implemented l
 | Live data health / freshness | All strategies | Nexus now fails closed on stale, missing, or unknown-freshness required feature inputs. | Available |
 
 ## Strategy Feature Requirements
+
+### `spy_open_specialist`
+
+Required features:
+
+| Field | Why it matters | Current source | Status |
+|---|---|---|---|
+| `ts_utc` | Window assignment and time-aware rules. | Raw option trade stream. | Available |
+| `symbol` | Strategy scope. | Stream config or event field. | Available |
+| `side` | Requires call-side dominance. | Derivable from `raw_symbol`; Nexus also reads event side. | Available |
+| `premium` | `$200k` call-premium hurdle. | Derivable from price times size times 100. | Available |
+| `iv_rank` | Cheap-volatility filter for the opening window. | `stats:{symbol}:iv_rank` or live VRP fallback. | Partial |
+
+Minimum acceptable live behavior:
+
+- Runs only for the 10:00 ET decision using the completed 09:30-10:00 window.
+- Requires call premium above `NEXUS_MIN_WINDOW_PREMIUM`, IV rank below `30`, and call premium dominance above `NEXUS_OPEN_CALL_DOMINANCE`.
+- Runtime behavior: Nexus blocks this strategy when IV rank is missing or stale.
 
 ### `spy_low_sweep_core`
 

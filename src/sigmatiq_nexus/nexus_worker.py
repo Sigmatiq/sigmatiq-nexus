@@ -18,11 +18,12 @@ from redis.asyncio.cluster import RedisCluster
 # --- CONFIGURATION ---
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 REDIS_CLUSTER = os.environ.get("NEXUS_REDIS_CLUSTER", "false").strip().lower() == "true"
-SYMBOLS = {s.strip().upper() for s in os.environ.get("NEXUS_SYMBOLS", "SPY").split(",") if s.strip()}
+SYMBOLS = {s.strip().upper() for s in os.environ.get("NEXUS_SYMBOLS", "SPY,QQQ").split(",") if s.strip()}
 INPUT_STREAM = os.environ.get("NEXUS_INPUT_STREAM")
-FIRST_TRIGGER_SCOPE = os.environ.get("NEXUS_FIRST_TRIGGER_SCOPE", "symbol").strip().lower()
+FIRST_TRIGGER_SCOPE = os.environ.get("NEXUS_FIRST_TRIGGER_SCOPE", "etf_group").strip().lower()
 MIN_WINDOW_PREMIUM = float(os.environ.get("NEXUS_MIN_WINDOW_PREMIUM", "200000"))
 SIDE_DOMINANCE = float(os.environ.get("NEXUS_SIDE_DOMINANCE", "2.0"))
+OPEN_CALL_DOMINANCE = float(os.environ.get("NEXUS_OPEN_CALL_DOMINANCE", "1.5"))
 LIVE_PERSISTENCE_EVENT_STREAM = os.environ.get("LIVE_PERSISTENCE_EVENT_STREAM", "live:persistence:events")
 
 IV_RANK_KEY_TEMPLATE = os.environ.get("NEXUS_IV_RANK_KEY", "stats:{symbol}:iv_rank")
@@ -123,6 +124,7 @@ CONTEXT_TIMESTAMP_FIELDS = (
 )
 FRESH_STATUSES = {"available", "derived", "fallback"}
 STRATEGY_REQUIRED_FEATURES = {
+    "spy_open_specialist": ("ts_utc", "symbol", "side", "premium", "iv_rank"),
     "spy_low_sweep_core": ("ts_utc", "symbol", "raw_symbol", "side", "premium", "is_sweep"),
     "spy_flow_specialist": (
         "ts_utc",
@@ -668,7 +670,7 @@ class SigmatiqNexus:
         self.buffers = {}
         self.max_buffer = 5000
 
-        print("Loading Dual-Brain AI (SPY only)...")
+        print("Loading Dual-Brain AI (SPY + QQQ)...")
         self.session_v6 = ort.InferenceSession(MODEL_V6_PATH)
         scaler_v6 = np.load(SCALER_V6_PATH)
         self.v6_mean = scaler_v6["mean"]
@@ -761,23 +763,27 @@ class SigmatiqNexus:
 
     async def evaluate_strategy(self, symbol, slot: dict, event_dt_utc: datetime):
         session_date = ny_session_date(event_dt_utc)
-        if signal_key(session_date, symbol, "*") in self.signaled_today:
+        if self.already_signaled(session_date, symbol, "*"):
             return
         slot_df = window_df_for_slot(pl.DataFrame(list(self.buffers[symbol])), slot)
         if slot_df.height == 0:
             return
 
         # Deterministic order follows the research log: confluence first, then
-        # low-sweep core, v6 flow, and v10 momentum. First trigger wins.
+        # the specialist assigned to the completed window. First trigger wins.
         await self.evaluate_confluence_sniper(slot_df, symbol, slot, session_date)
+        if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "10:00":
+            await self.evaluate_open_specialist(slot_df, symbol, slot, session_date)
         if not self.already_signaled(session_date, symbol, "*"):
             await self.evaluate_low_sweep_core(slot_df, symbol, slot, session_date)
-        if not self.already_signaled(session_date, symbol, "*"):
+        if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "10:30":
             await self.evaluate_flow_specialist(slot_df, symbol, slot, session_date)
-        if not self.already_signaled(session_date, symbol, "*"):
+        if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "11:00":
             await self.evaluate_momentum_specialist(slot_df, symbol, slot, session_date)
 
     def already_signaled(self, session_date, symbol: str, strategy: str) -> bool:
+        if FIRST_TRIGGER_SCOPE == "etf_group" and signal_key(session_date, "*", "*") in self.signaled_today:
+            return True
         return signal_key(session_date, symbol, strategy) in self.signaled_today or signal_key(session_date, symbol, "*") in self.signaled_today
 
     async def get_context(self, symbol: str) -> tuple[float, float, float]:
@@ -994,6 +1000,30 @@ class SigmatiqNexus:
         expected_change = delta * (s_now - s_start)
         return (actual_change - expected_change) / (p_start + 1e-9)
 
+    async def evaluate_open_specialist(self, df, symbol, slot: dict, session_date):
+        strategy = "spy_open_specialist"
+        if self.already_signaled(session_date, symbol, strategy) or slot["entry_label"] != "10:00":
+            return
+        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
+            return
+        sentiment, valid = await self.check_open_specialist_heuristic(df, symbol, slot)
+        if valid:
+            await self._publish_intermediate(strategy, symbol, sentiment, slot)
+            await self._publish_final(strategy, symbol, sentiment, 0.95, session_date, slot)
+
+    async def check_open_specialist_heuristic(self, df, symbol, slot: dict):
+        if slot["entry_label"] != "10:00":
+            return None, False
+        iv_rank, _, _ = await self.get_context(symbol)
+        if iv_rank >= 30:
+            return None, False
+        stats = window_stats(df)
+        if stats["call_p"] < MIN_WINDOW_PREMIUM:
+            return None, False
+        if stats["put_p"] > 0 and stats["call_p"] < stats["put_p"] * OPEN_CALL_DOMINANCE:
+            return None, False
+        return "BULLISH", True
+
     async def evaluate_low_sweep_core(self, df, symbol, slot: dict, session_date):
         strategy = "spy_low_sweep_core"
         if self.already_signaled(session_date, symbol, strategy):
@@ -1123,7 +1153,7 @@ class SigmatiqNexus:
         await self._append_persistence_event(symbol, msg)
         await self.redis.publish(f"signal:intermediate:{strategy}", json.dumps(msg))
 
-    async def _publish_final(self, strategy, symbol, sentiment, confidence, session_date=None, slot: dict | None = None):
+    async def _publish_final(self, strategy: str, symbol: str, sentiment: str, confidence: float, session_date=None, slot: dict | None = None):
         msg = {"strategy": strategy, "symbol": symbol, "stage": 2, "decision": "BET", "sentiment": sentiment, "confidence": float(confidence), "timestamp": datetime.now(timezone.utc).isoformat(), "source": "sigmatiq_nexus"}
         if session_date:
             msg["session_date"] = str(session_date)
@@ -1133,6 +1163,9 @@ class SigmatiqNexus:
         self.signaled_today.add(signal_key(key_date, symbol, strategy))
         if FIRST_TRIGGER_SCOPE == "symbol":
             self.signaled_today.add(signal_key(key_date, symbol, "*"))
+        elif FIRST_TRIGGER_SCOPE == "etf_group":
+            self.signaled_today.add(signal_key(key_date, symbol, "*"))
+            self.signaled_today.add(signal_key(key_date, "*", "*"))
         await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
         await self._append_persistence_event(symbol, msg)
         await self.redis.publish("nexus_live_overlay:updates", symbol)

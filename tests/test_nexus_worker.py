@@ -95,6 +95,7 @@ def test_feature_audit_blocks_raw_trade_payload_missing_strategy_fields():
     assert audit["features"]["is_sweep"]["status"] == "missing"
     assert audit["strategies"]["spy_low_sweep_core"]["status"] == "blocked"
     assert "is_sweep" in audit["strategies"]["spy_low_sweep_core"]["missing"]
+    assert "iv_rank" in audit["strategies"]["spy_open_specialist"]["missing"]
     assert "delta" in audit["strategies"]["spy_flow_specialist"]["missing"]
     assert "underlying_mid" in audit["strategies"]["spy_momentum_specialist"]["missing"]
 
@@ -147,6 +148,18 @@ def test_feature_audit_blocks_confluence_when_only_trade_price_exists():
     confluence = audit["strategies"]["spy_confluence_sniper"]
     assert confluence["status"] == "blocked"
     assert confluence["missing"] == ["option_mid"]
+
+
+def test_open_specialist_uses_cheap_call_dominance_for_1000_entry():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({"options:live:vrp:SPY": json.dumps({"ivRank": 24.0, "asOf": "2026-05-05T14:00:00Z"})})
+    df = pl.DataFrame([
+        row("2026-05-05T13:35:00Z", "C", 210_000, sweep=True),
+        row("2026-05-05T13:50:00Z", "P", 100_000, sweep=True),
+    ])
+
+    assert asyncio.run(worker.check_open_specialist_heuristic(df, "SPY", nw.DECISION_SLOTS[0])) == ("BULLISH", True)
+    assert asyncio.run(worker.check_open_specialist_heuristic(df, "SPY", nw.DECISION_SLOTS[1])) == (None, False)
 
 
 def test_low_sweep_core_allows_only_research_windows_and_sides():
@@ -668,20 +681,21 @@ def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
     async def confluence(df, symbol, slot, session_date):
         calls.append("confluence")
 
-    async def low(df, symbol, slot, session_date):
-        calls.append("low")
-        await worker._publish_final("spy_low_sweep_core", symbol, "BULLISH", 1.0, session_date, slot)
+    async def open_specialist(df, symbol, slot, session_date):
+        calls.append("open")
+        await worker._publish_final("spy_open_specialist", symbol, "BULLISH", 0.95, session_date, slot)
 
     async def hybrid(df, symbol, slot, session_date):
         calls.append("hybrid")
 
     worker.evaluate_confluence_sniper = confluence
-    worker.evaluate_low_sweep_core = low
+    worker.evaluate_open_specialist = open_specialist
+    worker.evaluate_low_sweep_core = hybrid
     worker.evaluate_flow_specialist = hybrid
 
     asyncio.run(worker.evaluate_strategy("SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5, 14, 5, tzinfo=timezone.utc)))
 
-    assert calls == ["confluence", "low"]
+    assert calls == ["confluence", "open"]
     assert len(worker.redis.sets) == 1
 
 

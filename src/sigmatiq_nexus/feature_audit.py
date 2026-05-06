@@ -29,6 +29,13 @@ class FeatureCheck:
 
 
 STRATEGY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "spy_open_specialist": (
+        "ts_utc",
+        "symbol",
+        "side",
+        "premium",
+        "iv_rank",
+    ),
     "spy_low_sweep_core": (
         "ts_utc",
         "symbol",

@@ -18,7 +18,9 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - `10:00` evaluates `09:30-10:00`, `10:30` evaluates `10:00-10:30`, `11:00` evaluates `10:30-11:00`, and `12:00` evaluates `11:30-12:00`.
 - First trigger wins by default per `session_date + symbol`, so only one final live overlay is published per symbol per NY session.
 - Set `NEXUS_FIRST_TRIGGER_SCOPE=strategy` only when each strategy is allowed to fire independently.
-- `spy_low_sweep_core` is evaluated before `spy_sharpened_alpha` because it is the research-backed low-sweep candidate.
+- `spy_confluence_sniper` is evaluated first for each eligible window.
+- `spy_open_specialist` is the explicit 10:00 ET cheap-call rule for the completed 09:30-10:00 window.
+- `spy_low_sweep_core` remains available as the tested low-sweep candidate; `spy_flow_specialist` and `spy_momentum_specialist` are restricted to their researched 10:30 and 11:00 entry windows.
 - Each strategy now has a fail-closed feature gate. If required live fields are missing, Nexus emits a stage `0` `BLOCKED` diagnostic to `live:persistence:events` and skips the strategy instead of defaulting missing booleans/numbers.
 
 ## Runtime configuration
@@ -40,6 +42,7 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - `NEXUS_GREEK_MAX_AGE_SECONDS`: max Greek age on enriched events, default `60`.
 - `NEXUS_SWEEP_PREMIUM_USD`: quote-derived sweep threshold when raw `is_sweep` is absent, default `25000`.
 - `NEXUS_MIN_WINDOW_PREMIUM` and `NEXUS_SIDE_DOMINANCE`: window-level premium and side-dominance thresholds.
+- `NEXUS_OPEN_CALL_DOMINANCE`: opening cheap-call dominance threshold, default `1.5`.
 - `LIVE_PERSISTENCE_EVENT_STREAM`: Redis Stream for durable signal capture, default `live:persistence:events`.
 
 ## Feature audit
