@@ -6,7 +6,7 @@ import numpy as np
 import polars as pl
 import redis.asyncio as redis
 import onnxruntime as ort
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time
 from collections import deque
 import pytz
 
@@ -23,14 +23,14 @@ class SigmatiqNexus:
         self.buffers = {}
         self.max_buffer = 100
         
-        print("Loading Hybrid Sniper Brain (ONNX)...")
-        # Hybrid Brain (v6)
+        print("Loading AI Brains (ONNX)...")
+        # 1. Hybrid Brain (v6)
         self.v6_hybrid = ort.InferenceSession(MODEL_V6_HYBRID)
         scaler_data = np.load(SCALER_V6_PATH)
         self.scaler_mean = scaler_data['mean']
         self.scaler_scale = scaler_data['scale']
         
-        # State: First Trigger Wins per Day
+        # State: One Signal Total per Day (across all strategies)
         self.last_reset_date = datetime.now(timezone.utc).date()
         self.signaled_today = set()
         
@@ -84,84 +84,85 @@ class SigmatiqNexus:
 
     async def evaluate_strategy(self, symbol):
         trades_df = pl.DataFrame(list(self.buffers[symbol]))
-        
-        # Get Current NY Time to determine the Window
         now_ny = datetime.now(self.tz_ny).time()
         
-        # --- STAGE 1: TIME-AWARE HEURISTIC ---
-        sentiment, stage1_valid = await self.calculate_time_aware_heuristic(trades_df, symbol, now_ny)
+        # --- PARALLEL EVALUATION OF STRATEGIES ---
+        # 1. Strategy: Sharpened Hybrid Alpha (v6)
+        asyncio.create_task(self.evaluate_hybrid_alpha(trades_df, symbol, now_ny))
         
+        # 2. Strategy: Low-Sweep Core (Strategy #2 Leader)
+        asyncio.create_task(self.evaluate_low_sweep_core(trades_df, symbol, now_ny))
+
+    async def evaluate_hybrid_alpha(self, trades_df, symbol, now_ny):
+        if symbol in self.signaled_today: return
+        
+        sentiment, stage1_valid = await self.calculate_hybrid_heuristic(trades_df, symbol, now_ny)
         if stage1_valid:
             # Event 1: Intermediate
-            intermediate_msg = {
-                "strategy": "spy_sharpened_alpha",
-                "symbol": symbol,
-                "stage": 1,
-                "sentiment": sentiment,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-            await self.redis.publish("signal:intermediate:spy_sharpened", json.dumps(intermediate_msg))
+            await self._publish_intermediate("spy_sharpened_alpha", symbol, sentiment)
             
-            # --- STAGE 2: HYBRID ML VALIDATION ---
+            # Event 2: Final
             decision, prob = await self.calculate_hybrid_validation(trades_df, symbol)
-            
             if decision == "BET":
-                # Event 2: Final (First Trigger Wins)
-                final_msg = {
-                    "strategy": "spy_sharpened_alpha",
-                    "symbol": symbol,
-                    "stage": 2,
-                    "decision": "BET",
-                    "sentiment": sentiment,
-                    "confidence": float(prob),
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }
-                self.signaled_today.add(symbol)
-                await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(final_msg))
-                await self.redis.publish("nexus_live_overlay:updates", symbol)
-                print(f"🚀 [BET] SHARPENED Alpha for {symbol} (Time: {now_ny}, Conf: {prob:.4f})")
+                await self._publish_final("spy_sharpened_alpha", symbol, sentiment, prob)
 
-    async def calculate_time_aware_heuristic(self, df, symbol, now_ny):
-        # Fetch Market Context
+    async def evaluate_low_sweep_core(self, trades_df, symbol, now_ny):
+        if symbol in self.signaled_today: return
+        
+        # Strategy #2 Heuristic: sweep_pct <= 0.10
+        sentiment, stage1_valid = await self.calculate_low_sweep_heuristic(trades_df, now_ny)
+        if stage1_valid:
+            # This is a pure-heuristic strategy (Stage 1 is the signal)
+            await self._publish_intermediate("spy_low_sweep_core", symbol, sentiment)
+            # For Strategy 2, Stage 1 meeting the rules is the BET
+            await self._publish_final("spy_low_sweep_core", symbol, sentiment, 1.0)
+
+    async def calculate_hybrid_heuristic(self, df, symbol, now_ny):
+        # Fetch Context
         iv_rank = float(await self.redis.get(f"stats:{symbol}:iv_rank") or 50.0)
         atm_iv = float(await self.redis.get(f"stats:{symbol}:atm_iv") or 15.0)
         net_gex = float(await self.redis.get(f"stats:{symbol}:net_gex") or 0.0)
         
         stats = df.select([
-            pl.col("premium").sum().alias("total_premium"),
-            (pl.col("premium").filter(pl.col("side") == "C").sum()).alias("call_premium"),
-            (pl.col("premium").filter(pl.col("side") == "P").sum()).alias("put_premium"),
-            (pl.col("is_sweep").mean()).alias("sweep_pct")
+            pl.col("premium").sum().alias("total_p"),
+            (pl.col("premium").filter(pl.col("side") == "C").sum()).alias("call_p"),
+            (pl.col("premium").filter(pl.col("side") == "P").sum()).alias("put_p"),
+            (pl.col("is_sweep").mean()).alias("sweep")
         ])
-        total_p = stats[0, "total_premium"]
-        call_p = stats[0, "call_premium"]
-        put_p = stats[0, "put_premium"]
-        sweep = stats[0, "sweep_pct"]
-
-        if total_p < 200000: return None, False
-
-        # --- WINDOW-SPECIFIC RULES ---
         
-        # 1. Open Window (09:30 - 10:00)
+        if stats[0, "total_p"] < 200000: return None, False
+
+        # Windows (As per Backtest Portfolio)
+        if now_ny < time(10, 30, 0): # 10:00 & 10:30 windows
+            if stats[0, "put_p"] > stats[0, "call_p"] * 2 and atm_iv > 0.15 and net_gex > -2e9: return "BEARISH", True
+            if stats[0, "call_p"] > stats[0, "put_p"] * 2 and iv_rank < 30 and stats[0, "sweep"] > 0.10: return "BULLISH", True
+        elif now_ny < time(11, 0, 0): # 11:00 window
+            if stats[0, "put_p"] > stats[0, "call_p"] * 2 and iv_rank > 30: return "BEARISH", True
+            if stats[0, "call_p"] > stats[0, "put_p"] * 2 and iv_rank < 30: return "BULLISH", True
+        elif time(11, 30, 0) <= now_ny < time(12, 0, 0): # Lunch
+            if net_gex < -1e9: return ("BEARISH", True) if stats[0, "put_p"] > stats[0, "call_p"] else ("BULLISH", True)
+            
+        return None, False
+
+    async def calculate_low_sweep_heuristic(self, df, now_ny):
+        stats = df.select([
+            pl.col("premium").sum().alias("total_p"),
+            (pl.col("premium").filter(pl.col("side") == "C").sum()).alias("call_p"),
+            (pl.col("premium").filter(pl.col("side") == "P").sum()).alias("put_p"),
+            (pl.col("is_sweep").mean()).alias("sweep")
+        ])
+        
+        if stats[0, "total_p"] < 200000: return None, False
+        if stats[0, "sweep"] > 0.10: return None, False # MUST be low-sweep
+        
+        # 10:00 window: Calls only
         if now_ny < time(10, 0, 0):
-            if call_p > put_p * 2.0 and iv_rank < 30: return "BULLISH", True
-            if put_p > call_p * 2.0 and iv_rank > 30: return "BEARISH", True
-
-        # 2. Morning Window (10:00 - 10:30)
+            if stats[0, "call_p"] > stats[0, "put_p"] * 2: return "BULLISH", True
+        # 10:30 window: Both
         elif now_ny < time(10, 30, 0):
-            if put_p > call_p * 2.0 and atm_iv > 0.15 and net_gex > -2e9: return "BEARISH", True
-            if call_p > put_p * 2.0 and iv_rank < 30 and sweep > 0.10: return "BULLISH", True
-
-        # 3. Pre-Lunch Window (10:30 - 11:00)
-        elif now_ny < time(11, 0, 0):
-            if put_p > call_p * 2.0 and iv_rank > 30: return "BEARISH", True
-            if call_p > put_p * 2.0 and iv_rank < 30: return "BULLISH", True
-
-        # 4. Lunch Sniper (11:30 - 12:00)
-        elif time(11, 30, 0) <= now_ny < time(12, 0, 0):
-            if put_p > call_p * 2.0 and net_gex < -1e9 and iv_rank > 30: return "BEARISH", True
-            if call_p > put_p * 2.0 and net_gex < -1e9: return "BULLISH", True
-
+            if stats[0, "call_p"] > stats[0, "put_p"] * 2: return "BULLISH", True
+            if stats[0, "put_p"] > stats[0, "call_p"] * 2: return "BEARISH", True
+            
         return None, False
 
     async def calculate_hybrid_validation(self, df, symbol):
@@ -191,7 +192,17 @@ class SigmatiqNexus:
         except Exception as e:
             print(f"AI Error: {e}"); return ("PASS", 0.0)
 
+    async def _publish_intermediate(self, strategy, symbol, sentiment):
+        msg = {"strategy": strategy, "symbol": symbol, "stage": 1, "sentiment": sentiment, "timestamp": datetime.now(timezone.utc).isoformat()}
+        await self.redis.publish(f"signal:intermediate:{strategy}", json.dumps(msg))
+
+    async def _publish_final(self, strategy, symbol, sentiment, confidence):
+        msg = {"strategy": strategy, "symbol": symbol, "stage": 2, "decision": "BET", "sentiment": sentiment, "confidence": float(confidence), "timestamp": datetime.now(timezone.utc).isoformat()}
+        self.signaled_today.add(symbol)
+        await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
+        await self.redis.publish("nexus_live_overlay:updates", symbol)
+        print(f"🚀 [BET] Signal generated for {symbol} via {strategy} (Conf: {confidence:.4f})")
+
 if __name__ == "__main__":
-    from datetime import time # Import for NY time comparison
     nexus = SigmatiqNexus()
     asyncio.run(nexus.run())
