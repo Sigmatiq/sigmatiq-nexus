@@ -213,7 +213,13 @@ def test_workflow_uses_configured_redis_host_variable():
     assert "rg-sigmatiq-prod" in text
     assert "secrets.NEXUS_REDIS_URL" in text
     assert "NEXUS_REDIS_CLUSTER=true" in text
-    assert "NEXUS_SYMBOLS=SPY" in text
+    assert "NEXUS_SYMBOLS=SPY,QQQ" in text
+    assert "NEXUS_FIRST_TRIGGER_SCOPE=etf_group" in text
+
+
+def test_default_symbols_and_scope_cover_combined_etf_sniper():
+    assert {"SPY", "QQQ"}.issubset(nw.SYMBOLS)
+    assert nw.FIRST_TRIGGER_SCOPE == "etf_group"
 
 class FakeRedis:
     def __init__(self, values=None):
@@ -697,6 +703,17 @@ def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
 
     assert calls == ["confluence", "open"]
     assert len(worker.redis.sets) == 1
+
+
+def test_etf_group_first_trigger_locks_other_etf_symbol():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.redis = FakeRedis()
+    session_date = datetime(2026, 5, 5).date()
+
+    asyncio.run(worker._publish_final("etf_open_specialist", "SPY", "BULLISH", 0.95, session_date, nw.DECISION_SLOTS[0]))
+
+    assert worker.already_signaled(session_date, "QQQ", "*")
 
 
 def test_context_falls_back_to_live_option_keys_when_stats_keys_are_absent():

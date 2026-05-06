@@ -28,7 +28,7 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - `REDIS_URL`: Redis connection URL used by the worker.
 - `NEXUS_REDIS_CLUSTER`: set to `true` for Azure clustered Redis.
 - `NEXUS_INPUT_STREAM`: optional explicit Redis stream. If absent, Nexus consumes `md:{symbol}:options:trades`.
-- `NEXUS_SYMBOLS`: comma-separated symbols to process, default `SPY`.
+- `NEXUS_SYMBOLS`: comma-separated symbols to process, default `SPY,QQQ`.
 - `NEXUS_IV_RANK_KEY`, `NEXUS_ATM_IV_KEY`, `NEXUS_NET_GEX_KEY`: optional direct Redis key templates for live context, each using `{symbol}`.
 - `NEXUS_IV_SURFACE_KEY`, `NEXUS_VRP_KEY`, `NEXUS_GEX_KEY`: live options-worker fallback key templates, defaulting to `options:live:*:{symbol}` keys.
 - `NEXUS_EQUITY_CONTEXT_KEY`: equity live context key template, default `equity:live:context:{symbol}`.
