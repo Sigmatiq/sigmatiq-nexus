@@ -315,14 +315,15 @@ Timestamp-less context keys are blocked by default through `NEXUS_REQUIRE_CONTEX
 - `BET`
   - Redis key: `nexus_live_overlay:{symbol}`
   - Pub/Sub: `nexus_live_overlay:updates`
-  - Payload now includes the exact traded `raw_symbol`, `expiry_date`, `strike`, and `option_side`
+  - Payload includes the exact traded `raw_symbol`, `expiry_date`, `strike`, `option_side`, `entry_quote`, `quote_freshness`, `quote_valid_until`, and an `execution` block with the current reference price and max published slippage
 - `WINDOW_VIEW`
   - Redis key: `nexus_window_view:{symbol}:{strategy}:{entry_label}`
   - Pub/Sub: `signal:window_view:{strategy}`
+  - `BLOCKED` diagnostics use the same key and Pub/Sub family with `decision="BLOCKED"` when a strategy cannot safely form a view because live inputs are missing, stale, or untradable
 - `WINDOW_PRICING`
   - Redis key: `nexus_window_pricing:{symbol}:{entry_label}`
   - Pub/Sub: `signal:window_pricing`
 - `LIQUIDATE`
   - Redis key: `nexus_live_overlay:{symbol}`
   - Pub/Sub: `nexus_live_overlay:updates`
-  - Exit return is now computed from the exact tracked contract `raw_symbol` using live contract-state / tradability Redis payloads, not arbitrary same-symbol trade flow
+  - Exit return is computed from the exact tracked contract `raw_symbol` using live contract-state / tradability Redis payloads, and the payload now carries `quote_freshness`, `quote_valid_until`, and an `execution` block for the exit quote snapshot

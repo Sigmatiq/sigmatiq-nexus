@@ -24,8 +24,8 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - `etf_low_sweep_core` remains available as the tested low-sweep candidate; `etf_flow_specialist` and `etf_momentum_specialist` are restricted to their researched 10:30 and 11:00 entry windows.
 - Every implemented strategy now publishes a per-window `WINDOW_VIEW` sentiment for every completed window from `09:30-12:00` ET, independent of whether that strategy is allowed to emit a trade candidate in that slot.
 - Nexus also publishes one per-window `WINDOW_PRICING` message per symbol/window with the cheapest contract, costliest contract, and cheap/costly side summary derived from pricing-lag inside that completed window.
-- Each strategy now has a fail-closed feature gate. If required live fields are missing, Nexus emits a stage `0` `BLOCKED` diagnostic to `live:persistence:events` and skips the strategy instead of defaulting missing booleans/numbers.
-- Final `BET` payloads now carry the exact option `raw_symbol`, and runtime liquidation tracks that exact contract via `options:live:contract_state:{raw_symbol}` / `options:live:tradability:{raw_symbol}` instead of comparing against unrelated same-symbol option trades.
+- Each strategy now has a fail-closed feature gate. If required live fields are missing, Nexus emits a stage `0` `BLOCKED` diagnostic on the same `nexus_window_view:{symbol}:{strategy}:{entry_label}` key family and skips the strategy instead of defaulting missing booleans/numbers.
+- Final `BET` payloads now carry the exact option `raw_symbol`, a live entry quote snapshot, quote freshness, quote-valid-until, and an explicit execution policy block. Runtime liquidation tracks that exact contract via `options:live:contract_state:{raw_symbol}` / `options:live:tradability:{raw_symbol}` instead of comparing against unrelated same-symbol option trades.
 
 ## Runtime configuration
 
@@ -46,6 +46,7 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - `NEXUS_OPTION_QUOTE_MAX_AGE_SECONDS`: max option quote/mid age on enriched events, default `5`.
 - `NEXUS_GREEK_MAX_AGE_SECONDS`: max Greek age on enriched events, default `60`.
 - `NEXUS_SWEEP_PREMIUM_USD`: quote-derived sweep threshold when raw `is_sweep` is absent, default `25000`.
+- `NEXUS_EXECUTION_MAX_SLIPPAGE_PCT`: slippage ceiling published in `BET` and `LIQUIDATE` execution blocks, default `5.0`.
 - `NEXUS_MIN_WINDOW_PREMIUM` and `NEXUS_SIDE_DOMINANCE`: window-level premium and side-dominance thresholds.
 - `NEXUS_OPEN_CALL_DOMINANCE`: opening cheap-call dominance threshold, default `1.5`.
 - `LIVE_PERSISTENCE_EVENT_STREAM`: Redis Stream for durable signal capture, default `live:persistence:events`.

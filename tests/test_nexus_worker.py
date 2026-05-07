@@ -309,7 +309,19 @@ def test_non_cluster_mode_uses_single_multi_stream_xread(monkeypatch):
 def test_publish_final_appends_live_persistence_event():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
-    worker.redis = FakeRedis()
+    worker.redis = FakeRedis({
+        "options:live:contract_state:SPY   260505C00720000": json.dumps({
+            "optionMid": 1.24,
+            "bid": 1.20,
+            "ask": 1.28,
+            "asOfUtc": "2026-05-05T14:00:00Z",
+            "tradable": True,
+        }),
+        "options:live:tradability:SPY   260505C00720000": json.dumps({
+            "quoteAgeMs": 700,
+            "tradabilityBucket": "tradable",
+        }),
+    })
 
     asyncio.run(worker._publish_final("etf_low_sweep_core", "SPY", "BULLISH", 1.0, 1.24, datetime(2026, 5, 5).date(), nw.DECISION_SLOTS[0], "SPY   260505C00720000"))
 
@@ -331,6 +343,17 @@ def test_publish_final_appends_live_persistence_event():
     assert payload["risk"]["stop_loss_pct"] == nw.STOP_LOSS_PCT
     assert payload["risk"]["guard_activate_pct"] == nw.GUARD_ACTIVATE_PCT
     assert payload["risk"]["guard_floor_pct"] == nw.GUARD_FLOOR_PCT
+    assert payload["quote_freshness"] == "available"
+    assert payload["quote_valid_until"] == "2026-05-05T14:00:05+00:00"
+    assert payload["entry_quote"]["option_mid"] == 1.24
+    assert payload["entry_quote"]["option_bid"] == 1.2
+    assert payload["entry_quote"]["option_ask"] == 1.28
+    assert payload["entry_quote"]["tradability_bucket"] == "tradable"
+    assert payload["execution"]["order_type"] == "limit"
+    assert payload["execution"]["price_reference"] == "option_mid"
+    assert payload["execution"]["reference_price"] == 1.24
+    assert payload["execution"]["max_slippage_pct"] == nw.EXECUTION_MAX_SLIPPAGE_PCT
+    assert payload["execution"]["quote_freshness"] == "available"
     assert maxlen == 10000
     assert approximate is True
 
@@ -542,13 +565,15 @@ def test_runtime_gate_blocks_low_sweep_when_sweep_classifier_is_missing():
 
     asyncio.run(worker.evaluate_low_sweep_core(df, "SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
 
-    assert worker.redis.sets == []
+    assert worker.redis.sets[0][0] == "nexus_window_view:SPY:etf_low_sweep_core:10:00"
     assert len(worker.redis.xadds) == 1
     blocked = json.loads(worker.redis.xadds[0][1]["payload_json"])
     assert blocked["decision"] == "BLOCKED"
     assert blocked["block_reason"] == "live_feature_quality_gate_closed"
     assert blocked["missing_features"] == ["is_sweep"]
     assert blocked["feature_failures"] == {"is_sweep": "missing"}
+    assert json.loads(worker.redis.sets[0][1]) == blocked
+    assert worker.redis.publishes[0][0] == "signal:window_view:etf_low_sweep_core"
 
 
 def test_runtime_gate_blocks_flow_when_live_context_is_missing():
@@ -564,7 +589,7 @@ def test_runtime_gate_blocks_flow_when_live_context_is_missing():
 
     asyncio.run(worker.evaluate_flow_specialist(df, "SPY", nw.DECISION_SLOTS[1], datetime(2026, 5, 5).date()))
 
-    assert worker.redis.sets == []
+    assert worker.redis.sets[0][0] == "nexus_window_view:SPY:etf_flow_specialist:10:30"
     blocked = json.loads(worker.redis.xadds[0][1]["payload_json"])
     assert blocked["decision"] == "BLOCKED"
     assert blocked["missing_features"] == ["atm_iv", "iv_rank", "net_gex"]
@@ -585,7 +610,7 @@ def test_runtime_gate_blocks_confluence_without_option_mid():
 
     asyncio.run(worker.evaluate_confluence_sniper(df, "SPY", nw.DECISION_SLOTS[1], datetime(2026, 5, 5).date()))
 
-    assert worker.redis.sets == []
+    assert worker.redis.sets[0][0] == "nexus_window_view:SPY:etf_confluence_sniper:10:30"
     blocked = json.loads(worker.redis.xadds[0][1]["payload_json"])
     assert blocked["decision"] == "BLOCKED"
     assert blocked["missing_features"] == ["option_mid"]
@@ -992,6 +1017,11 @@ def test_active_position_mid_uses_tracked_contract_not_unrelated_symbol_trade():
     assert liquidate["position_id"] == "sig_test_position"
     assert liquidate["raw_symbol"] == "SPY   260505C00700000"
     assert liquidate["exit_price"] == 4.9
+    assert liquidate["quote_freshness"] == "stale"
+    assert liquidate["quote_valid_until"] == "2026-05-05T14:06:05+00:00"
+    assert liquidate["execution"]["order_type"] == "limit"
+    assert liquidate["execution"]["reference_price"] == 4.9
+    assert liquidate["execution"]["quote_freshness"] == "stale"
 
 
 def test_evaluate_strategy_publishes_window_views_even_when_trade_locked():

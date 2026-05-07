@@ -54,6 +54,7 @@ SWEEP_PREMIUM_USD = float(os.environ.get("NEXUS_SWEEP_PREMIUM_USD", "25000"))
 STOP_LOSS_PCT = float(os.environ.get("NEXUS_STOP_LOSS_PCT", "-50.0"))
 GUARD_ACTIVATE_PCT = float(os.environ.get("NEXUS_GUARD_ACTIVATE_PCT", "15.0"))
 GUARD_FLOOR_PCT = float(os.environ.get("NEXUS_GUARD_FLOOR_PCT", "5.0"))
+EXECUTION_MAX_SLIPPAGE_PCT = float(os.environ.get("NEXUS_EXECUTION_MAX_SLIPPAGE_PCT", "5.0"))
 
 MODEL_V6_PATH = os.environ.get("NEXUS_V6_MODEL", "models/hybrid_spy_v6.onnx")
 SCALER_V6_PATH = os.environ.get("NEXUS_V6_SCALER", "models/hybrid_scaler_v6.npz")
@@ -223,6 +224,43 @@ def _freshness_status(reference_time: datetime | None, feature_time: datetime | 
         return "unknown_freshness" if missing_is_stale else "available"
     age_seconds = abs((reference_time - feature_time).total_seconds())
     return "available" if age_seconds <= max_age_seconds else "stale"
+
+
+def _quote_valid_until(reference_time: datetime | None, max_age_seconds: int = OPTION_QUOTE_MAX_AGE_SECONDS) -> str | None:
+    if not reference_time:
+        return None
+    return (reference_time + timedelta(seconds=max_age_seconds)).astimezone(timezone.utc).isoformat()
+
+
+def _quote_execution_snapshot(quote: dict | None, reference_time: datetime | None = None, *, price_field: str = "option_mid") -> dict:
+    quote = quote or {}
+    quote_ts = parse_optional_datetime(quote.get("quote_ts") or quote.get("quote_ts_utc"))
+    price = quote.get(price_field)
+    status_payload = {
+        "option_mid": quote.get("option_mid"),
+        "option_bid": quote.get("option_bid"),
+        "option_ask": quote.get("option_ask"),
+        "tradability_bucket": quote.get("tradability_bucket"),
+    }
+    if quote.get("quote_age_ms") is not None:
+        status_payload["quote_age_ms"] = quote.get("quote_age_ms")
+    if quote.get("quote_ts") or quote.get("quote_ts_utc"):
+        status_payload["quote_ts_utc"] = quote.get("quote_ts") or quote.get("quote_ts_utc")
+    freshness = _event_freshness_status(status_payload, reference_time or datetime.now(timezone.utc), "option_mid")
+    return {
+        "order_type": "limit",
+        "price_reference": "option_mid",
+        "reference_price": float(price) if price not in (None, "") else None,
+        "max_slippage_pct": EXECUTION_MAX_SLIPPAGE_PCT,
+        "quote_freshness": freshness,
+        "quote_valid_until": _quote_valid_until(quote_ts),
+        "quote_age_ms": quote.get("quote_age_ms"),
+        "option_bid": quote.get("option_bid"),
+        "option_ask": quote.get("option_ask"),
+        "option_mid": quote.get("option_mid"),
+        "quote_ts": quote.get("quote_ts") or quote.get("quote_ts_utc"),
+        "tradability_bucket": quote.get("tradability_bucket"),
+    }
 
 
 def _event_freshness_status(payload: dict, reference_time: datetime | None, feature: str) -> str:
@@ -995,6 +1033,7 @@ class SigmatiqNexus:
 
     async def _publish_liquidate(self, symbol, reason, ret, quote: dict | None = None):
         active_position = self.active_positions.get(symbol, {})
+        execution = _quote_execution_snapshot(quote, datetime.now(timezone.utc))
         msg = {
             "message_id": new_message_id(),
             "symbol": symbol,
@@ -1009,7 +1048,11 @@ class SigmatiqNexus:
             "option_bid": quote.get("option_bid") if quote else None,
             "option_ask": quote.get("option_ask") if quote else None,
             "quote_ts": quote.get("quote_ts") if quote else None,
+            "quote_age_ms": quote.get("quote_age_ms") if quote else None,
+            "quote_freshness": execution["quote_freshness"],
+            "quote_valid_until": execution["quote_valid_until"],
             "tradability_bucket": quote.get("tradability_bucket") if quote else None,
+            "execution": execution,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "source": "sigmatiq_nexus",
         }
@@ -1028,18 +1071,14 @@ class SigmatiqNexus:
             "option_bid": _payload_float(payload, "option_bid", "bid"),
             "option_ask": _payload_float(payload, "option_ask", "ask"),
             "quote_ts": _payload_value(payload, "quote_ts_utc", "option_mid_ts_utc", "option_quote_ts_utc", "ts_utc"),
+            "quote_age_ms": _payload_float(payload, "quote_age_ms", "quoteAgeMs", "option_quote_age_ms", "optionQuoteAgeMs"),
             "tradability_bucket": _payload_value(payload, "tradability_bucket", "tradabilityBucket"),
         }
 
-    async def _active_position_quote(self, symbol: str, position: dict, payload: dict) -> dict:
-        tracked_raw_symbol = normalize_raw_symbol(position.get("raw_symbol"))
+    async def _contract_quote_snapshot(self, symbol: str, raw_symbol: str | None) -> dict:
+        tracked_raw_symbol = normalize_raw_symbol(raw_symbol)
         if not tracked_raw_symbol:
-            return self._quote_from_payload(symbol, None, payload)
-
-        payload_raw_symbol = normalize_raw_symbol(payload.get("raw_symbol") or payload.get("rawSymbol"))
-        if payload_raw_symbol == tracked_raw_symbol:
-            return self._quote_from_payload(symbol, tracked_raw_symbol, payload)
-
+            return {}
         state_key = CONTRACT_STATE_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=tracked_raw_symbol)
         tradability_key = CONTRACT_TRADABILITY_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=tracked_raw_symbol)
         contract_state, tradability = await asyncio.gather(
@@ -1050,6 +1089,17 @@ class SigmatiqNexus:
         _merge_contract_payload(exact_payload, contract_state)
         _merge_contract_payload(exact_payload, tradability)
         return self._quote_from_payload(symbol, tracked_raw_symbol, exact_payload)
+
+    async def _active_position_quote(self, symbol: str, position: dict, payload: dict) -> dict:
+        tracked_raw_symbol = normalize_raw_symbol(position.get("raw_symbol"))
+        if not tracked_raw_symbol:
+            return self._quote_from_payload(symbol, None, payload)
+
+        payload_raw_symbol = normalize_raw_symbol(payload.get("raw_symbol") or payload.get("rawSymbol"))
+        if payload_raw_symbol == tracked_raw_symbol:
+            return self._quote_from_payload(symbol, tracked_raw_symbol, payload)
+
+        return await self._contract_quote_snapshot(symbol, tracked_raw_symbol)
 
     async def evaluate_strategy(self, symbol, slot: dict, event_dt_utc: datetime):
         session_date = ny_session_date(event_dt_utc)
@@ -1264,7 +1314,10 @@ class SigmatiqNexus:
             feature_failures=failures,
             **self._window_log_fields(pl.DataFrame(), slot),
         )
-        await self._append_persistence_event_for_key(f"nexus_window_view:{symbol}:{strategy}:{slot['entry_label']}", msg)
+        redis_key = f"nexus_window_view:{symbol}:{strategy}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg))
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self.redis.publish(f"signal:window_view:{strategy}", json.dumps(msg))
 
     async def _publish_window_view(self, strategy: str, symbol: str, sentiment: str, reason: str, slot: dict, session_date) -> None:
         key = (str(session_date), symbol, strategy, slot["entry_label"])
@@ -1694,6 +1747,8 @@ class SigmatiqNexus:
             session_date = entry_price
             entry_price = 0.0
         signal_id = build_signal_id(strategy, symbol, session_date, slot, raw_symbol)
+        quote = await self._contract_quote_snapshot(symbol, raw_symbol) if raw_symbol else {}
+        execution = _quote_execution_snapshot(quote, datetime.now(timezone.utc))
         msg = {
             "message_id": new_message_id(),
             "signal_id": signal_id,
@@ -1705,6 +1760,17 @@ class SigmatiqNexus:
             "sentiment": sentiment,
             "confidence": float(confidence),
             "entry_price": entry_price,
+            "quote_freshness": execution["quote_freshness"],
+            "quote_valid_until": execution["quote_valid_until"],
+            "entry_quote": {
+                "option_mid": quote.get("option_mid"),
+                "option_bid": quote.get("option_bid"),
+                "option_ask": quote.get("option_ask"),
+                "quote_ts": quote.get("quote_ts"),
+                "quote_age_ms": quote.get("quote_age_ms"),
+                "tradability_bucket": quote.get("tradability_bucket"),
+            },
+            "execution": execution,
             "risk": {
                 "stop_loss_pct": STOP_LOSS_PCT,
                 "guard_activate_pct": GUARD_ACTIVATE_PCT,
