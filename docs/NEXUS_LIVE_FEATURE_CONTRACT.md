@@ -16,6 +16,12 @@ Scope is intentionally limited to implemented Nexus strategies and implemented l
 | `etf_flow_specialist` | Phase 2 support | 10:30 ET entry from 10:00-10:30 window | Strong option-flow dominance with IV/GEX context. |
 | `etf_momentum_specialist` | Phase 2 support | 11:00 ET entry from 10:30-11:00 window | Underlying persistence plus option-flow confirmation. |
 
+All five implemented strategies also publish a per-window directional assessment for every completed window from `09:30-12:00` ET:
+
+- `decision = WINDOW_VIEW`
+- `sentiment = BULLISH | BEARISH | CHOP`
+- this is informational only and does not imply a trade candidate
+
 ## Feature Availability Summary
 
 | Feature group | Needed by | Current availability | Status |

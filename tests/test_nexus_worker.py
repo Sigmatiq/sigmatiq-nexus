@@ -33,6 +33,15 @@ def test_decision_slot_uses_event_time_in_new_york():
     assert slot["window_end"].isoformat() == "10:00:00"
 
 
+def test_decision_slot_includes_1130_completed_window():
+    slot = nw.decision_slot(datetime(2026, 5, 5, 15, 35, tzinfo=timezone.utc))
+
+    assert slot is not None
+    assert slot["entry_label"] == "11:30"
+    assert slot["window_start"].isoformat() == "11:00:00"
+    assert slot["window_end"].isoformat() == "11:30:00"
+
+
 def test_window_df_for_slot_uses_completed_window_not_current_tick_window():
     df = pl.DataFrame([
         row("2026-05-05T13:35:00Z", "C", 150_000),  # 09:35 ET, included for 10:00 entry
@@ -77,6 +86,16 @@ def test_decode_msgpack_stream_entry_derives_live_trade_fields():
     assert decoded["premium"] == 500.0
     assert decoded["is_sweep"] is False
     assert decoded["ts_utc"].startswith("2026-")
+
+
+def test_contract_details_from_raw_symbol_parses_expiry_strike_and_side():
+    details = nw._contract_details_from_raw_symbol("SPY   260505P00719000")
+
+    assert details == {
+        "expiry_date": "2026-05-05",
+        "strike": 719.0,
+        "side": "P",
+    }
 
 
 def test_feature_audit_blocks_raw_trade_payload_missing_strategy_fields():
@@ -302,6 +321,92 @@ def test_publish_final_appends_live_persistence_event():
     assert payload["decision"] == "BET"
     assert maxlen == 10000
     assert approximate is True
+
+
+def test_publish_window_view_sets_key_and_appends_persistence_event():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    worker.window_views_reported = set()
+    worker._current_window_df = pl.DataFrame([
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00720000",
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "side": "C",
+            "price": 12.5,
+            "size": 300,
+            "premium": 375_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": 0.5,
+            "gamma": 0.01,
+        }),
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505P00700000",
+            "ts_utc": "2026-05-05T13:36:00Z",
+            "side": "P",
+            "price": 5.0,
+            "size": 100,
+            "premium": 50_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": -0.4,
+            "gamma": 0.01,
+        }),
+    ])
+
+    asyncio.run(worker._publish_window_view(
+        "etf_low_sweep_core",
+        "SPY",
+        "BULLISH",
+        "low_sweep_call_dominance",
+        nw.DECISION_SLOTS[0],
+        datetime(2026, 5, 5).date(),
+    ))
+
+    assert worker.redis.sets[0][0] == "nexus_window_view:SPY:etf_low_sweep_core:10:00"
+    payload = json.loads(worker.redis.sets[0][1])
+    assert payload["decision"] == "WINDOW_VIEW"
+    assert payload["sentiment"] == "BULLISH"
+    assert payload["reason"] == "low_sweep_call_dominance"
+    assert payload["lead_contract_raw_symbol"] == "SPY   260505C00720000"
+    assert payload["lead_contract_expiry_date"] == "2026-05-05"
+    assert payload["lead_contract_strike"] == 720.0
+    assert payload["lead_contract_side"] == "C"
+    assert worker.redis.xadds[0][1]["redis_key"] == "nexus_window_view:SPY:etf_low_sweep_core:10:00"
+    assert worker.redis.publishes[0][0] == "signal:window_view:etf_low_sweep_core"
+
+
+def test_enrich_trade_payload_from_redis_merges_underlying_and_contract_state():
+    payload = nw.normalize_trade_payload({
+        "symbol": "SPY",
+        "raw_symbol": "SPY   260505C00700000",
+        "ts_utc": "2026-05-05T14:00:00Z",
+        "side": "C",
+        "price": 1.25,
+        "size": 10,
+        "premium": 1250.0,
+    })
+    redis_client = FakeRedis({
+        "equity:live:context:SPY": json.dumps({"price": 700.25, "lastPriceUtc": "2026-05-05T14:00:00Z"}),
+        "options:live:contract_state:SPY   260505C00700000": json.dumps({
+            "mid": 1.24,
+            "quoteAgeMs": 250,
+            "delta": 0.52,
+            "gamma": 0.018,
+            "asOfUtc": "2026-05-05T14:00:00Z",
+        }),
+    })
+
+    enriched = asyncio.run(nw.enrich_trade_payload_from_redis(payload, redis_client))
+
+    assert enriched["underlying_mid"] == 700.25
+    assert enriched["option_mid"] == 1.24
+    assert enriched["delta"] == 0.52
+    assert enriched["gamma"] == 0.018
+    assert enriched["_feature_status"]["underlying_mid"] == "available"
+    assert enriched["_feature_status"]["option_mid"] == "available"
 
 
 def test_runtime_gate_blocks_low_sweep_when_sweep_classifier_is_missing():
@@ -689,6 +794,7 @@ def test_contract_state_can_satisfy_confluence_required_features():
 def test_runtime_gate_allows_enriched_low_sweep_signal():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
+    worker.active_positions = {}
     worker.redis = FakeRedis()
     payload = {
         "symbol": "SPY",
@@ -714,14 +820,74 @@ def test_runtime_gate_allows_enriched_low_sweep_signal():
     assert final["decision"] == "BET"
 
 
+def test_evaluate_strategy_publishes_window_views_even_when_trade_locked():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = {nw.signal_key(datetime(2026, 5, 5).date(), "SPY", "*")}
+    worker.window_views_reported = set()
+    worker.feature_blocks_reported = set()
+    worker.active_positions = {}
+    worker.redis = FakeRedis({
+        "options:live:vrp:SPY": json.dumps({"ivRank": 20, "asOf": "2026-05-05T14:05:00Z"}),
+        "options:live:iv_surface:SPY": json.dumps({"atmIv": 0.22, "asOf": "2026-05-05T14:05:00Z"}),
+        "options:live:gex:SPY": json.dumps({"netGex": 1_000_000, "asOf": "2026-05-05T14:05:00Z"}),
+    })
+    worker.buffers = {
+        "SPY": [
+            nw.normalize_trade_payload({
+                "symbol": "SPY",
+                "raw_symbol": "SPY   260505C00700000",
+                "ts_utc": "2026-05-05T13:35:00Z",
+                "side": "C",
+                "price": 12.5,
+                "size": 200,
+                "premium": 250_000,
+                "is_sweep": False,
+                "aggressor": "A",
+                "delta": 0.50,
+                "gamma": 0.01,
+                "greeks_ts_utc": "2026-05-05T13:35:00Z",
+                "underlying_mid": 700.25,
+                "underlying_ts_utc": "2026-05-05T13:35:00Z",
+                "option_mid": 12.4,
+                "quote_age_ms": 100,
+            })
+        ]
+    }
+
+    asyncio.run(worker.evaluate_strategy("SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5, 14, 5, tzinfo=timezone.utc)))
+
+    decisions = [json.loads(value)["decision"] for _, value in worker.redis.sets]
+    assert "WINDOW_VIEW" in decisions
+    assert "BET" not in decisions
+
+
 def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
     worker.redis = FakeRedis()
+    worker.window_views_reported = set()
+    worker.feature_blocks_reported = set()
+    worker.active_positions = {}
     worker.buffers = {
-        "SPY": [
-            row("2026-05-05T13:35:00Z", "C", 250_000, sweep=False),
-            row("2026-05-05T14:05:00Z", "P", 500_000, sweep=True),
+        "QQQ": [
+            nw.normalize_trade_payload({
+                "symbol": "QQQ",
+                "raw_symbol": "QQQ   260505C00500000",
+                "ts_utc": "2026-05-05T13:35:00Z",
+                "side": "C",
+                "price": 12.5,
+                "size": 200,
+                "premium": 250_000,
+                "is_sweep": False,
+                "aggressor": "A",
+                "delta": 0.50,
+                "gamma": 0.01,
+                "greeks_ts_utc": "2026-05-05T13:35:00Z",
+                "underlying_mid": 500.25,
+                "underlying_ts_utc": "2026-05-05T13:35:00Z",
+                "option_mid": 12.4,
+                "quote_age_ms": 100,
+            }),
         ]
     }
     calls = []
@@ -741,21 +907,23 @@ def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
     worker.evaluate_low_sweep_core = hybrid
     worker.evaluate_flow_specialist = hybrid
 
-    asyncio.run(worker.evaluate_strategy("SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5, 14, 5, tzinfo=timezone.utc)))
+    asyncio.run(worker.evaluate_strategy("QQQ", nw.DECISION_SLOTS[0], datetime(2026, 5, 5, 14, 5, tzinfo=timezone.utc)))
 
     assert calls == ["confluence", "open"]
-    assert len(worker.redis.sets) == 1
+    bet_messages = [json.loads(value) for _, value in worker.redis.sets if json.loads(value).get("decision") == "BET"]
+    assert len(bet_messages) == 1
 
 
 def test_etf_group_first_trigger_locks_other_etf_symbol():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
+    worker.active_positions = {}
     worker.redis = FakeRedis()
     session_date = datetime(2026, 5, 5).date()
 
-    asyncio.run(worker._publish_final("etf_open_specialist", "SPY", "BULLISH", 0.95, session_date, nw.DECISION_SLOTS[0]))
+    asyncio.run(worker._publish_final("etf_open_specialist", "QQQ", "BULLISH", 0.95, session_date, nw.DECISION_SLOTS[0]))
 
-    assert worker.already_signaled(session_date, "QQQ", "*")
+    assert worker.already_signaled(session_date, "SPY", "*")
 
 
 def test_context_falls_back_to_live_option_keys_when_stats_keys_are_absent():
