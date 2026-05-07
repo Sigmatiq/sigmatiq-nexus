@@ -21,6 +21,11 @@ REDIS_CLUSTER = os.environ.get("NEXUS_REDIS_CLUSTER", "false").strip().lower() =
 SYMBOLS = {s.strip().upper() for s in os.environ.get("NEXUS_SYMBOLS", "SPY,QQQ").split(",") if s.strip()}
 INPUT_STREAM = os.environ.get("NEXUS_INPUT_STREAM")
 FIRST_TRIGGER_SCOPE = os.environ.get("NEXUS_FIRST_TRIGGER_SCOPE", "symbol").strip().lower()
+GROUP_LOCK_STRATEGIES = {
+    s.strip()
+    for s in os.environ.get("NEXUS_GROUP_LOCK_STRATEGIES", "etf_confluence_sniper").split(",")
+    if s.strip()
+}
 MIN_WINDOW_PREMIUM = float(os.environ.get("NEXUS_MIN_WINDOW_PREMIUM", "200000"))
 SIDE_DOMINANCE = float(os.environ.get("NEXUS_SIDE_DOMINANCE", "2.0"))
 OPEN_CALL_DOMINANCE = float(os.environ.get("NEXUS_OPEN_CALL_DOMINANCE", "1.5"))
@@ -277,6 +282,14 @@ def signal_key(session_date, symbol: str, strategy: str) -> str:
     return f"{session_date}:{symbol}"
 
 
+def symbol_lane_key(session_date, symbol: str) -> str:
+    return f"{session_date}:{symbol}"
+
+
+def group_lock_key(session_date, strategy: str) -> str:
+    return f"{session_date}:group:{strategy}"
+
+
 def _option_side_from_raw_symbol(raw_symbol: str | None) -> str | None:
     if not raw_symbol:
         return None
@@ -293,12 +306,13 @@ def _contract_details_from_raw_symbol(raw_symbol: str | None) -> dict[str, str |
     if len(compact) < 15:
         return {"expiry_date": None, "strike": None, "side": _option_side_from_raw_symbol(raw_symbol)}
     try:
-        option_side = compact[-9]
         expiry_raw = compact[-15:-9]
         strike_raw = compact[-8:]
-        expiry_date = f"20{expiry_raw[0:2]}-{expiry_raw[2:4]}-{expiry_raw[4:6]}"
-        strike = int(strike_raw) / 1000.0
-        return {"expiry_date": expiry_date, "strike": strike, "side": option_side}
+        return {
+            "expiry_date": f"20{expiry_raw[0:2]}-{expiry_raw[2:4]}-{expiry_raw[4:6]}",
+            "strike": int(strike_raw) / 1000.0,
+            "side": compact[-9],
+        }
     except Exception:
         return {"expiry_date": None, "strike": None, "side": _option_side_from_raw_symbol(raw_symbol)}
 
@@ -714,6 +728,7 @@ class SigmatiqNexus:
         self.signaled_today = set()
         self.feature_blocks_reported = set()
         self.window_views_reported = set()
+        self.window_pricing_reported = set()
         self.redis = None
 
     def _log(self, event: str, **fields) -> None:
@@ -755,6 +770,93 @@ class SigmatiqNexus:
         raw_symbol = lead[0, "raw_symbol"]
         details = _contract_details_from_raw_symbol(raw_symbol)
         return {"raw_symbol": raw_symbol, **details}
+
+    def _contract_pricing_profiles(self, df: pl.DataFrame) -> list[dict]:
+        required = {"ts_utc", "raw_symbol", "underlying_mid", "delta"}
+        if df.is_empty() or not required.issubset(set(df.columns)):
+            return []
+        price_col = "option_mid" if "option_mid" in df.columns else "price" if "price" in df.columns else None
+        if price_col is None:
+            return []
+        profiles: list[dict] = []
+        for raw_symbol in df.select("raw_symbol").drop_nulls().unique()["raw_symbol"].to_list():
+            hist = (
+                df.filter(pl.col("raw_symbol") == raw_symbol)
+                .with_columns(pl.col("ts_utc").str.to_datetime(strict=False, time_zone="UTC").alias("_dt_utc"))
+                .sort("_dt_utc")
+            )
+            if hist.height < 2:
+                continue
+            end = hist.tail(1)
+            end_ts = end[0, "_dt_utc"]
+            start = hist.filter(pl.col("_dt_utc") <= end_ts - timedelta(minutes=5)).tail(1)
+            if start.is_empty():
+                start = hist.head(1)
+            p_start = float(start[0, price_col] or 0.0)
+            p_now = float(end[0, price_col] or 0.0)
+            s_start = float(start[0, "underlying_mid"] or 0.0)
+            s_now = float(end[0, "underlying_mid"] or 0.0)
+            delta = float(start[0, "delta"] or 0.0)
+            if p_start <= 0:
+                continue
+            actual_change = p_now - p_start
+            expected_change = delta * (s_now - s_start)
+            pricing_lag = (actual_change - expected_change) / (p_start + 1e-9)
+            details = _contract_details_from_raw_symbol(raw_symbol)
+            premium = hist.select(pl.col("premium").cast(pl.Float64, strict=False).fill_null(0).sum()).item() if "premium" in hist.columns else 0.0
+            cheapness_score = max(0.0, min(100.0, 50.0 + (-pricing_lag * 500.0)))
+            profiles.append({
+                "raw_symbol": raw_symbol,
+                "pricing_lag": round(float(pricing_lag), 6),
+                "cheapness_score": round(float(cheapness_score), 2),
+                "premium": float(premium),
+                "side": str(end[0, "side"] or details["side"] or ""),
+                "expiry_date": details["expiry_date"],
+                "strike": details["strike"],
+            })
+        return profiles
+
+    def _window_pricing_summary(self, df: pl.DataFrame) -> dict:
+        profiles = self._contract_pricing_profiles(df)
+        if not profiles:
+            return {
+                "profiles": [],
+                "evaluated_contract_count": 0,
+                "cheap_contract": None,
+                "costly_contract": None,
+                "cheap_side": None,
+                "cheap_side_avg_pricing_lag": None,
+                "costly_side": None,
+                "costly_side_avg_pricing_lag": None,
+            }
+        cheapest = min(profiles, key=lambda p: p["pricing_lag"])
+        costliest = max(profiles, key=lambda p: p["pricing_lag"])
+        side_buckets: dict[str, dict[str, float]] = {}
+        for profile in profiles:
+            side = profile["side"]
+            if side not in {"C", "P"}:
+                continue
+            bucket = side_buckets.setdefault(side, {"weighted_lag": 0.0, "premium": 0.0})
+            weight = max(profile["premium"], 1.0)
+            bucket["weighted_lag"] += profile["pricing_lag"] * weight
+            bucket["premium"] += weight
+        side_avgs = {
+            side: bucket["weighted_lag"] / bucket["premium"]
+            for side, bucket in side_buckets.items()
+            if bucket["premium"] > 0
+        }
+        cheap_side = min(side_avgs, key=side_avgs.get) if side_avgs else None
+        costly_side = max(side_avgs, key=side_avgs.get) if side_avgs else None
+        return {
+            "profiles": profiles,
+            "evaluated_contract_count": len(profiles),
+            "cheap_contract": cheapest,
+            "costly_contract": costliest,
+            "cheap_side": cheap_side,
+            "cheap_side_avg_pricing_lag": round(float(side_avgs[cheap_side]), 6) if cheap_side else None,
+            "costly_side": costly_side,
+            "costly_side_avg_pricing_lag": round(float(side_avgs[costly_side]), 6) if costly_side else None,
+        }
 
     async def connect(self):
         if REDIS_CLUSTER:
@@ -819,6 +921,7 @@ class SigmatiqNexus:
             self.active_positions.clear()
             self.feature_blocks_reported.clear()
             self.window_views_reported.clear()
+            self.window_pricing_reported.clear()
             self.last_reset_session_date = current_session_date
 
     async def process_message(self, data):
@@ -904,6 +1007,7 @@ class SigmatiqNexus:
             trade_locked=trade_locked,
             **self._window_log_fields(slot_df, slot),
         )
+        await self.publish_window_pricing(slot_df, symbol, slot, session_date)
         await self.publish_window_assessments(slot_df, symbol, slot, session_date)
         if trade_locked:
             self._log("trade_evaluation_skipped", symbol=symbol, session_date=str(session_date), reason="already_signaled", entry_time=slot["entry_label"])
@@ -922,9 +1026,13 @@ class SigmatiqNexus:
             await self.evaluate_momentum_specialist(slot_df, symbol, slot, session_date)
 
     def already_signaled(self, session_date, symbol: str, strategy: str) -> bool:
-        if FIRST_TRIGGER_SCOPE == "etf_group" and signal_key(session_date, "*", "*") in self.signaled_today:
+        if symbol_lane_key(session_date, symbol) in self.signaled_today:
             return True
-        return signal_key(session_date, symbol, strategy) in self.signaled_today or signal_key(session_date, symbol, "*") in self.signaled_today
+        if strategy in GROUP_LOCK_STRATEGIES and group_lock_key(session_date, strategy) in self.signaled_today:
+            return True
+        if FIRST_TRIGGER_SCOPE == "strategy" and signal_key(session_date, symbol, strategy) in self.signaled_today:
+            return True
+        return False
 
     async def get_context(self, symbol: str) -> tuple[float, float, float]:
         iv_rank, atm_iv, net_gex, _ = await self.get_context_with_quality(symbol)
@@ -1109,15 +1217,65 @@ class SigmatiqNexus:
             "source": "sigmatiq_nexus",
         }
         lead_contract = self._window_lead_contract(getattr(self, "_current_window_df", pl.DataFrame()))
+        pricing_summary = getattr(self, "_current_window_pricing_summary", {}) or {}
+        profiles = pricing_summary.get("profiles") or []
+        lead_pricing = next((p for p in profiles if p["raw_symbol"] == lead_contract["raw_symbol"]), None)
         msg["lead_contract_raw_symbol"] = lead_contract["raw_symbol"]
         msg["lead_contract_expiry_date"] = lead_contract["expiry_date"]
         msg["lead_contract_strike"] = lead_contract["strike"]
         msg["lead_contract_side"] = lead_contract["side"]
+        msg["lead_contract_pricing_lag"] = lead_pricing["pricing_lag"] if lead_pricing else None
+        msg["lead_contract_cheapness_score"] = lead_pricing["cheapness_score"] if lead_pricing else None
         redis_key = f"nexus_window_view:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
         await self.redis.publish(f"signal:window_view:{strategy}", json.dumps(msg))
         self._log("strategy_window_view_published", strategy=strategy, symbol=symbol, sentiment=sentiment, reason=reason, session_date=str(session_date), entry_time=slot["entry_label"])
+
+    async def publish_window_pricing(self, df: pl.DataFrame, symbol: str, slot: dict, session_date) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "window_pricing_reported", set())
+        if key in reported:
+            return
+        reported.add(key)
+        self.window_pricing_reported = reported
+        summary = self._window_pricing_summary(df)
+        self._current_window_pricing_summary = summary
+        cheap = summary["cheap_contract"]
+        costly = summary["costly_contract"]
+        msg = {
+            "symbol": symbol,
+            "stage": 0,
+            "decision": "WINDOW_PRICING",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_date": str(session_date),
+            "entry_time": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "evaluated_contract_count": summary["evaluated_contract_count"],
+            "cheap_contract_raw_symbol": cheap["raw_symbol"] if cheap else None,
+            "cheap_contract_expiry_date": cheap["expiry_date"] if cheap else None,
+            "cheap_contract_strike": cheap["strike"] if cheap else None,
+            "cheap_contract_side": cheap["side"] if cheap else None,
+            "cheap_contract_pricing_lag": cheap["pricing_lag"] if cheap else None,
+            "cheap_contract_cheapness_score": cheap["cheapness_score"] if cheap else None,
+            "costly_contract_raw_symbol": costly["raw_symbol"] if costly else None,
+            "costly_contract_expiry_date": costly["expiry_date"] if costly else None,
+            "costly_contract_strike": costly["strike"] if costly else None,
+            "costly_contract_side": costly["side"] if costly else None,
+            "costly_contract_pricing_lag": costly["pricing_lag"] if costly else None,
+            "costly_contract_cheapness_score": costly["cheapness_score"] if costly else None,
+            "cheap_side": summary["cheap_side"],
+            "cheap_side_avg_pricing_lag": summary["cheap_side_avg_pricing_lag"],
+            "costly_side": summary["costly_side"],
+            "costly_side_avg_pricing_lag": summary["costly_side_avg_pricing_lag"],
+            "source": "sigmatiq_nexus",
+        }
+        redis_key = f"nexus_window_pricing:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg))
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self.redis.publish("signal:window_pricing", json.dumps(msg))
+        self._log("window_pricing_published", symbol=symbol, session_date=str(session_date), entry_time=slot["entry_label"], evaluated_contract_count=summary["evaluated_contract_count"])
 
     async def publish_window_assessments(self, df: pl.DataFrame, symbol: str, slot: dict, session_date) -> None:
         self._current_window_df = df
@@ -1136,6 +1294,7 @@ class SigmatiqNexus:
             sentiment, reason = await assessor(df, symbol, slot)
             await self._publish_window_view(strategy, symbol, sentiment, reason, slot, session_date)
         self._current_window_df = pl.DataFrame()
+        self._current_window_pricing_summary = {}
 
     def _get_lead_price(self, df: pl.DataFrame, sentiment: str) -> float:
         side = "C" if sentiment == "BULLISH" else "P"
@@ -1454,12 +1613,11 @@ class SigmatiqNexus:
         if slot:
             msg.update({"entry_time": slot["entry_label"], "window_start": slot["window_start"].isoformat(), "window_end": slot["window_end"].isoformat()})
         key_date = session_date or ny_session_date(datetime.now(timezone.utc))
-        self.signaled_today.add(signal_key(key_date, symbol, strategy))
-        if FIRST_TRIGGER_SCOPE == "symbol":
-            self.signaled_today.add(signal_key(key_date, symbol, "*"))
-        elif FIRST_TRIGGER_SCOPE == "etf_group":
-            self.signaled_today.add(signal_key(key_date, symbol, "*"))
-            self.signaled_today.add(signal_key(key_date, "*", "*"))
+        self.signaled_today.add(symbol_lane_key(key_date, symbol))
+        if FIRST_TRIGGER_SCOPE == "strategy":
+            self.signaled_today.add(signal_key(key_date, symbol, strategy))
+        if strategy in GROUP_LOCK_STRATEGIES:
+            self.signaled_today.add(group_lock_key(key_date, strategy))
         
         # Track position for dynamic exit
         active_positions = getattr(self, "active_positions", None)

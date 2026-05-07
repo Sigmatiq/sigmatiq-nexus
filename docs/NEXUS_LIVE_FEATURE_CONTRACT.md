@@ -6,6 +6,12 @@ This document defines the live features Nexus needs to run the currently impleme
 
 Scope is intentionally limited to implemented Nexus strategies and implemented live data producers. Strategy decisions stay in Nexus. Upstream workers should publish reusable market features, not strategy-specific decisions, unless the feature is broadly useful and stateful.
 
+Current lock model:
+
+- one independent final-trade lane per symbol per NY session
+- plus one shared group lock for `etf_confluence_sniper` across the configured ETF universe
+- this allows `SPY` and `QQQ` to fire independently while still keeping the group confluence lane single-fire
+
 ## Current Nexus Strategies
 
 | Strategy | Current role | Main decision window | Core idea |
@@ -21,6 +27,13 @@ All five implemented strategies also publish a per-window directional assessment
 - `decision = WINDOW_VIEW`
 - `sentiment = BULLISH | BEARISH | CHOP`
 - this is informational only and does not imply a trade candidate
+- `lead_contract_pricing_lag` and `lead_contract_cheapness_score` now annotate the dominant contract inside each strategy window view
+
+Nexus also publishes a symbol-level window pricing summary for every completed window:
+
+- `decision = WINDOW_PRICING`
+- includes `cheap_contract_*`, `costly_contract_*`, `cheap_side`, and `costly_side`
+- this is also informational only and separate from trade candidates
 
 ## Feature Availability Summary
 

@@ -16,12 +16,14 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 
 - Decisions are based on completed New York trading windows, not wall-clock time on the worker host.
 - `10:00` evaluates `09:30-10:00`, `10:30` evaluates `10:00-10:30`, `11:00` evaluates `10:30-11:00`, `11:30` evaluates `11:00-11:30`, and `12:00` evaluates `11:30-12:00`.
-- First trigger wins by default per `session_date + symbol`, so only one final live overlay is published per symbol per NY session.
-- Set `NEXUS_FIRST_TRIGGER_SCOPE=strategy` only when each strategy is allowed to fire independently.
+- First trigger wins by default per `session_date + symbol`, so each symbol has one independent trade lane per NY session.
+- `etf_confluence_sniper` also participates in a separate shared group lock across the configured ETF universe, controlled by `NEXUS_GROUP_LOCK_STRATEGIES`.
+- Result: `SPY` and `QQQ` can each fire independently, while the group confluence lane still remains single-fire.
 - `etf_confluence_sniper` is evaluated first for each eligible window.
 - `etf_open_specialist` is the explicit 10:00 ET cheap-call rule for the completed 09:30-10:00 window.
 - `etf_low_sweep_core` remains available as the tested low-sweep candidate; `etf_flow_specialist` and `etf_momentum_specialist` are restricted to their researched 10:30 and 11:00 entry windows.
 - Every implemented strategy now publishes a per-window `WINDOW_VIEW` sentiment for every completed window from `09:30-12:00` ET, independent of whether that strategy is allowed to emit a trade candidate in that slot.
+- Nexus also publishes one per-window `WINDOW_PRICING` message per symbol/window with the cheapest contract, costliest contract, and cheap/costly side summary derived from pricing-lag inside that completed window.
 - Each strategy now has a fail-closed feature gate. If required live fields are missing, Nexus emits a stage `0` `BLOCKED` diagnostic to `live:persistence:events` and skips the strategy instead of defaulting missing booleans/numbers.
 
 ## Runtime configuration
@@ -30,6 +32,7 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - `NEXUS_REDIS_CLUSTER`: set to `true` for Azure clustered Redis. In cluster mode Nexus reads each configured input stream separately so Redis does not reject multi-key `XREAD` calls across hash slots.
 - `NEXUS_INPUT_STREAM`: optional explicit Redis stream. If absent, Nexus consumes `md:{symbol}:options:trades`.
 - `NEXUS_SYMBOLS`: comma-separated symbols to process, default `SPY,QQQ`.
+- `NEXUS_GROUP_LOCK_STRATEGIES`: comma-separated strategy names that should also share one cross-symbol group lock, default `etf_confluence_sniper`.
 - `NEXUS_IV_RANK_KEY`, `NEXUS_ATM_IV_KEY`, `NEXUS_NET_GEX_KEY`: optional direct Redis key templates for live context, each using `{symbol}`.
 - `NEXUS_IV_SURFACE_KEY`, `NEXUS_VRP_KEY`, `NEXUS_GEX_KEY`: live options-worker fallback key templates, defaulting to `options:live:*:{symbol}` keys.
 - `NEXUS_EQUITY_CONTEXT_KEY`: equity live context key template, default `equity:live:context:{symbol}`.
@@ -71,6 +74,7 @@ Nexus now emits structured JSON logs for the decision path so production checks 
 - `slot_candidate_received`, `window_evaluation_started`: confirms events are arriving for a symbol and a completed NY window is being evaluated with real premium totals.
 - `strategy_blocked`: emitted when fail-closed feature gates reject a strategy due to missing or stale live fields.
 - `strategy_window_view_published`: emitted when a strategy publishes its directional read of a completed window as `BULLISH`, `BEARISH`, or `CHOP`.
+- `window_pricing_published`: emitted when Nexus publishes the separate cheap-versus-costly contract summary for the completed window.
 - `strategy_no_signal`: emitted when data is present but the heuristic or model threshold did not qualify.
 - `strategy_intermediate_published`, `strategy_final_published`, `position_liquidated`: emitted when Nexus actually produces a signal or exits a live position.
 

@@ -233,12 +233,14 @@ def test_workflow_uses_configured_redis_host_variable():
     assert "secrets.NEXUS_REDIS_URL" in text
     assert "NEXUS_REDIS_CLUSTER=true" in text
     assert "NEXUS_SYMBOLS=SPY,QQQ" in text
-    assert "NEXUS_FIRST_TRIGGER_SCOPE=etf_group" in text
+    assert "NEXUS_FIRST_TRIGGER_SCOPE=symbol" in text
+    assert "NEXUS_GROUP_LOCK_STRATEGIES=etf_confluence_sniper" in text
 
 
 def test_default_symbols_and_scope_cover_combined_etf_sniper():
     assert {"SPY", "QQQ"}.issubset(nw.SYMBOLS)
-    assert nw.FIRST_TRIGGER_SCOPE == "etf_group"
+    assert nw.FIRST_TRIGGER_SCOPE == "symbol"
+    assert "etf_confluence_sniper" in nw.GROUP_LOCK_STRATEGIES
 
 class FakeRedis:
     def __init__(self, values=None):
@@ -340,6 +342,8 @@ def test_publish_window_view_sets_key_and_appends_persistence_event():
             "aggressor": "A",
             "delta": 0.5,
             "gamma": 0.01,
+            "underlying_mid": 720.0,
+            "option_mid": 12.5,
         }),
         nw.normalize_trade_payload({
             "symbol": "SPY",
@@ -353,8 +357,11 @@ def test_publish_window_view_sets_key_and_appends_persistence_event():
             "aggressor": "A",
             "delta": -0.4,
             "gamma": 0.01,
+            "underlying_mid": 719.5,
+            "option_mid": 5.0,
         }),
     ])
+    worker._current_window_pricing_summary = worker._window_pricing_summary(worker._current_window_df)
 
     asyncio.run(worker._publish_window_view(
         "etf_low_sweep_core",
@@ -374,8 +381,89 @@ def test_publish_window_view_sets_key_and_appends_persistence_event():
     assert payload["lead_contract_expiry_date"] == "2026-05-05"
     assert payload["lead_contract_strike"] == 720.0
     assert payload["lead_contract_side"] == "C"
+    assert "lead_contract_pricing_lag" in payload
+    assert "lead_contract_cheapness_score" in payload
     assert worker.redis.xadds[0][1]["redis_key"] == "nexus_window_view:SPY:etf_low_sweep_core:10:00"
     assert worker.redis.publishes[0][0] == "signal:window_view:etf_low_sweep_core"
+
+
+def test_publish_window_pricing_sets_key_and_side_summary():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    worker.window_pricing_reported = set()
+    df = pl.DataFrame([
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00720000",
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "side": "C",
+            "price": 10.0,
+            "size": 200,
+            "premium": 200_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": 0.50,
+            "gamma": 0.01,
+            "underlying_mid": 720.0,
+            "option_mid": 10.0,
+        }),
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00720000",
+            "ts_utc": "2026-05-05T13:41:00Z",
+            "side": "C",
+            "price": 10.4,
+            "size": 200,
+            "premium": 208_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": 0.50,
+            "gamma": 0.01,
+            "underlying_mid": 721.5,
+            "option_mid": 10.4,
+        }),
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505P00700000",
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "side": "P",
+            "price": 8.0,
+            "size": 150,
+            "premium": 120_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": -0.45,
+            "gamma": 0.01,
+            "underlying_mid": 720.0,
+            "option_mid": 8.0,
+        }),
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505P00700000",
+            "ts_utc": "2026-05-05T13:41:00Z",
+            "side": "P",
+            "price": 7.4,
+            "size": 150,
+            "premium": 111_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": -0.45,
+            "gamma": 0.01,
+            "underlying_mid": 721.5,
+            "option_mid": 7.4,
+        }),
+    ])
+
+    asyncio.run(worker.publish_window_pricing(df, "SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
+
+    payload = json.loads(worker.redis.sets[0][1])
+    assert worker.redis.sets[0][0] == "nexus_window_pricing:SPY:10:00"
+    assert payload["decision"] == "WINDOW_PRICING"
+    assert payload["cheap_contract_raw_symbol"] is not None
+    assert payload["costly_contract_raw_symbol"] is not None
+    assert payload["cheap_side"] in {"C", "P"}
+    assert payload["costly_side"] in {"C", "P"}
+    assert worker.redis.publishes[0][0] == "signal:window_pricing"
 
 
 def test_enrich_trade_payload_from_redis_merges_underlying_and_contract_state():
@@ -914,7 +1002,7 @@ def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
     assert len(bet_messages) == 1
 
 
-def test_etf_group_first_trigger_locks_other_etf_symbol():
+def test_symbol_lane_does_not_lock_other_symbol():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
     worker.active_positions = {}
@@ -923,7 +1011,21 @@ def test_etf_group_first_trigger_locks_other_etf_symbol():
 
     asyncio.run(worker._publish_final("etf_open_specialist", "QQQ", "BULLISH", 0.95, session_date, nw.DECISION_SLOTS[0]))
 
-    assert worker.already_signaled(session_date, "SPY", "*")
+    assert not worker.already_signaled(session_date, "SPY", "etf_open_specialist")
+    assert worker.already_signaled(session_date, "QQQ", "etf_open_specialist")
+
+
+def test_confluence_group_lock_blocks_other_symbol_confluence_only():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.redis = FakeRedis()
+    session_date = datetime(2026, 5, 5).date()
+
+    asyncio.run(worker._publish_final("etf_confluence_sniper", "QQQ", "BULLISH", 0.95, session_date, nw.DECISION_SLOTS[0]))
+
+    assert worker.already_signaled(session_date, "SPY", "etf_confluence_sniper")
+    assert not worker.already_signaled(session_date, "SPY", "etf_open_specialist")
 
 
 def test_context_falls_back_to_live_option_keys_when_stats_keys_are_absent():
