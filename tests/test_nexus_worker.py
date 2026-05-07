@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import deque
 from datetime import datetime, timezone
 
 import msgpack
@@ -310,7 +311,7 @@ def test_publish_final_appends_live_persistence_event():
     worker.signaled_today = set()
     worker.redis = FakeRedis()
 
-    asyncio.run(worker._publish_final("etf_low_sweep_core", "SPY", "BULLISH", 1.0))
+    asyncio.run(worker._publish_final("etf_low_sweep_core", "SPY", "BULLISH", 1.0, 1.24, datetime(2026, 5, 5).date(), nw.DECISION_SLOTS[0], "SPY   260505C00720000"))
 
     assert len(worker.redis.sets) == 1
     assert len(worker.redis.xadds) == 1
@@ -321,8 +322,37 @@ def test_publish_final_appends_live_persistence_event():
     assert payload["strategy"] == "etf_low_sweep_core"
     assert payload["stage"] == 2
     assert payload["decision"] == "BET"
+    assert payload["signal_id"].startswith("sig_")
+    assert payload["position_id"] == payload["signal_id"]
+    assert payload["raw_symbol"] == "SPY   260505C00720000"
+    assert payload["expiry_date"] == "2026-05-05"
+    assert payload["strike"] == 720.0
+    assert payload["option_side"] == "C"
+    assert payload["risk"]["stop_loss_pct"] == nw.STOP_LOSS_PCT
+    assert payload["risk"]["guard_activate_pct"] == nw.GUARD_ACTIVATE_PCT
+    assert payload["risk"]["guard_floor_pct"] == nw.GUARD_FLOOR_PCT
     assert maxlen == 10000
     assert approximate is True
+
+
+def test_publish_intermediate_sets_key_and_appends_persistence_event():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+
+    asyncio.run(worker._publish_intermediate("etf_low_sweep_core", "SPY", "BULLISH", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date(), "SPY   260505C00720000"))
+
+    assert worker.redis.sets[0][0] == "nexus_intermediate:SPY:etf_low_sweep_core:10:00"
+    payload = json.loads(worker.redis.sets[0][1])
+    assert payload["strategy"] == "etf_low_sweep_core"
+    assert payload["stage"] == 1
+    assert payload["decision"] == "INTERMEDIATE"
+    assert payload["sentiment"] == "BULLISH"
+    assert payload["signal_id"].startswith("sig_")
+    assert payload["position_id"] == payload["signal_id"]
+    assert payload["raw_symbol"] == "SPY   260505C00720000"
+    assert worker.redis.xadds[0][1]["redis_key"] == "nexus_intermediate:SPY:etf_low_sweep_core:10:00"
+    assert worker.redis.publishes[0] == ("nexus_intermediate:updates", "SPY")
+    assert worker.redis.publishes[1][0] == "signal:intermediate:etf_low_sweep_core"
 
 
 def test_publish_window_view_sets_key_and_appends_persistence_event():
@@ -901,11 +931,67 @@ def test_runtime_gate_allows_enriched_low_sweep_signal():
 
     asyncio.run(worker.evaluate_low_sweep_core(df, "SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
 
-    assert len(worker.redis.sets) == 1
+    assert len(worker.redis.sets) == 2
     assert len(worker.redis.xadds) == 2
-    final = json.loads(worker.redis.sets[0][1])
+    assert worker.redis.sets[0][0] == "nexus_intermediate:SPY:etf_low_sweep_core:10:00"
+    assert worker.redis.sets[1][0] == "nexus_live_overlay:SPY"
+    final = json.loads(worker.redis.sets[1][1])
     assert final["strategy"] == "etf_low_sweep_core"
     assert final["decision"] == "BET"
+    assert final["raw_symbol"] == "SPY   260505C00700000"
+
+
+def test_active_position_mid_uses_tracked_contract_not_unrelated_symbol_trade():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.active_positions = {
+        "SPY": {
+            "entry_price": 10.0,
+            "is_guarded": False,
+            "side": "BULLISH",
+            "raw_symbol": "SPY   260505C00700000",
+            "signal_id": "sig_test_position",
+            "position_id": "sig_test_position",
+        }
+    }
+    worker.redis = FakeRedis({
+        "options:live:contract_state:SPY   260505C00700000": json.dumps({
+            "optionMid": 4.9,
+            "asOfUtc": "2026-05-05T14:06:00Z",
+            "tradable": True,
+        }),
+    })
+    worker.last_reset_session_date = datetime(2026, 5, 5).date()
+    worker.buffers = {"SPY": deque(maxlen=10)}
+    worker.feature_blocks_reported = set()
+    worker.window_views_reported = set()
+    worker.window_pricing_reported = set()
+
+    unrelated_payload = {
+        "symbol": "SPY",
+        "raw_symbol": "SPY   260505C00710000",
+        "ts_utc": "2026-05-05T14:06:00Z",
+        "side": "C",
+        "price": 2.0,
+        "size": 10,
+        "premium": 2_000.0,
+        "is_sweep": False,
+        "aggressor": "A",
+        "delta": 0.50,
+        "gamma": 0.01,
+        "option_mid": 20.0,
+    }
+
+    asyncio.run(worker.process_message({"payload": json.dumps(unrelated_payload)}))
+
+    assert "SPY" not in worker.active_positions
+    liquidate = next(json.loads(value) for _, value in worker.redis.sets if json.loads(value).get("decision") == "LIQUIDATE")
+    assert liquidate["decision"] == "LIQUIDATE"
+    assert liquidate["reason"] == "STOP_LOSS"
+    assert liquidate["signal_id"] == "sig_test_position"
+    assert liquidate["position_id"] == "sig_test_position"
+    assert liquidate["raw_symbol"] == "SPY   260505C00700000"
+    assert liquidate["exit_price"] == 4.9
 
 
 def test_evaluate_strategy_publishes_window_views_even_when_trade_locked():

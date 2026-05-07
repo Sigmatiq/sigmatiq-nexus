@@ -306,3 +306,23 @@ Current state:
 | Greeks | 60 seconds | `NEXUS_GREEK_MAX_AGE_SECONDS` |
 
 Timestamp-less context keys are blocked by default through `NEXUS_REQUIRE_CONTEXT_TIMESTAMPS=true`. This is intentional: scalar values can still be read by `get_context()`, but strategy gates require timestamped context before allowing live decisions.
+## Published Nexus Messages
+
+- `INTERMEDIATE`
+  - Redis key: `nexus_intermediate:{symbol}:{strategy}:{entry_label}`
+  - Pub/Sub: `nexus_intermediate:updates` with symbol and `signal:intermediate:{strategy}` with full payload
+  - Meaning: strategy heuristic passed and the setup is a stage-1 candidate, but no final `BET` has been published yet
+- `BET`
+  - Redis key: `nexus_live_overlay:{symbol}`
+  - Pub/Sub: `nexus_live_overlay:updates`
+  - Payload now includes the exact traded `raw_symbol`, `expiry_date`, `strike`, and `option_side`
+- `WINDOW_VIEW`
+  - Redis key: `nexus_window_view:{symbol}:{strategy}:{entry_label}`
+  - Pub/Sub: `signal:window_view:{strategy}`
+- `WINDOW_PRICING`
+  - Redis key: `nexus_window_pricing:{symbol}:{entry_label}`
+  - Pub/Sub: `signal:window_pricing`
+- `LIQUIDATE`
+  - Redis key: `nexus_live_overlay:{symbol}`
+  - Pub/Sub: `nexus_live_overlay:updates`
+  - Exit return is now computed from the exact tracked contract `raw_symbol` using live contract-state / tradability Redis payloads, not arbitrary same-symbol trade flow

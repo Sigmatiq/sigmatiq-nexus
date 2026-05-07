@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from collections import deque
 from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import quote, urlparse
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import msgpack
@@ -49,6 +51,9 @@ GREEK_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_GREEK_MAX_AGE_SECONDS", "60"))
 AGGRESSOR_EDGE_PCT = float(os.environ.get("NEXUS_AGGRESSOR_EDGE_PCT", "0.20"))
 AGGRESSOR_MAX_SPREAD_PCT = float(os.environ.get("NEXUS_AGGRESSOR_MAX_SPREAD_PCT", "0.25"))
 SWEEP_PREMIUM_USD = float(os.environ.get("NEXUS_SWEEP_PREMIUM_USD", "25000"))
+STOP_LOSS_PCT = float(os.environ.get("NEXUS_STOP_LOSS_PCT", "-50.0"))
+GUARD_ACTIVATE_PCT = float(os.environ.get("NEXUS_GUARD_ACTIVATE_PCT", "15.0"))
+GUARD_FLOOR_PCT = float(os.environ.get("NEXUS_GUARD_FLOOR_PCT", "5.0"))
 
 MODEL_V6_PATH = os.environ.get("NEXUS_V6_MODEL", "models/hybrid_spy_v6.onnx")
 SCALER_V6_PATH = os.environ.get("NEXUS_V6_SCALER", "models/hybrid_scaler_v6.npz")
@@ -438,6 +443,22 @@ def normalize_raw_symbol(raw_symbol: str | None) -> str:
     return str(raw_symbol or "").strip().upper()
 
 
+def build_signal_id(strategy: str, symbol: str, session_date, slot: dict | None, raw_symbol: str | None) -> str:
+    entry_label = slot["entry_label"] if slot else "na"
+    base = "|".join([
+        str(session_date or ""),
+        str(symbol or "").upper(),
+        str(strategy or ""),
+        entry_label,
+        normalize_raw_symbol(raw_symbol),
+    ])
+    return f"sig_{hashlib.sha1(base.encode('utf-8')).hexdigest()[:16]}"
+
+
+def new_message_id() -> str:
+    return f"msg_{uuid4().hex}"
+
+
 def _event_feature_status(payload: dict, raw_symbol: str | None) -> dict[str, str]:
     reference_time = parse_event_datetime(payload) if _payload_has_any(payload, "ts_utc", "timestamp", "ts_event_ns") else None
     status = {}
@@ -708,7 +729,7 @@ class SigmatiqNexus:
     def __init__(self):
         self.buffers = {}
         self.max_buffer = 5000
-        self.active_positions = {} # Tracks {symbol: {'entry_price': float, 'is_guarded': bool, 'side': str}}
+        self.active_positions = {} # Tracks {symbol: {'entry_price': float, 'is_guarded': bool, 'side': str, 'raw_symbol': str, 'signal_id': str, 'position_id': str}}
 
         print("Loading Triple-ETF Sniper (SPY, QQQ, IWM)...")
         self.session_v6 = ort.InferenceSession(MODEL_V6_PATH)
@@ -938,20 +959,21 @@ class SigmatiqNexus:
             # --- DYNAMIC RISK MANAGEMENT (EXIT MONITORING) ---
             if symbol in self.active_positions:
                 pos = self.active_positions[symbol]
-                curr_price = float(payload.get("option_mid") or 0.0)
+                quote = await self._active_position_quote(symbol, pos, payload)
+                curr_price = float(quote.get("option_mid") or 0.0)
                 if curr_price > 0:
                     ret = ((curr_price - pos['entry_price']) / pos['entry_price']) * 100
                     
                     # 1. Hard Stop
-                    if ret <= -50.0:
-                        await self._publish_liquidate(symbol, "STOP_LOSS", ret)
+                    if ret <= STOP_LOSS_PCT:
+                        await self._publish_liquidate(symbol, "STOP_LOSS", ret, quote)
                     # 2. Guard Activation
-                    elif not pos['is_guarded'] and ret >= 15.0:
+                    elif not pos['is_guarded'] and ret >= GUARD_ACTIVATE_PCT:
                         pos['is_guarded'] = True
                         print(f"🛡️ [GUARD] Breakeven guard activated for {symbol} at +{ret:.1f}%")
                     # 3. Guard Execution
-                    elif pos['is_guarded'] and ret <= 5.0:
-                        await self._publish_liquidate(symbol, "GUARD_EXIT", ret)
+                    elif pos['is_guarded'] and ret <= GUARD_FLOOR_PCT:
+                        await self._publish_liquidate(symbol, "GUARD_EXIT", ret, quote)
 
             if symbol not in self.buffers:
                 self.buffers[symbol] = deque(maxlen=self.max_buffer)
@@ -971,14 +993,63 @@ class SigmatiqNexus:
         except Exception as e:
             self._log("process_message_failed", error=str(e))
 
-    async def _publish_liquidate(self, symbol, reason, ret):
-        msg = {"symbol": symbol, "decision": "LIQUIDATE", "reason": reason, "return_pct": float(ret), "timestamp": datetime.now(timezone.utc).isoformat(), "source": "sigmatiq_nexus"}
+    async def _publish_liquidate(self, symbol, reason, ret, quote: dict | None = None):
+        active_position = self.active_positions.get(symbol, {})
+        msg = {
+            "message_id": new_message_id(),
+            "symbol": symbol,
+            "decision": "LIQUIDATE",
+            "reason": reason,
+            "return_pct": float(ret),
+            "signal_id": active_position.get("signal_id"),
+            "position_id": active_position.get("position_id"),
+            "raw_symbol": active_position.get("raw_symbol"),
+            "entry_price": active_position.get("entry_price"),
+            "exit_price": quote.get("option_mid") if quote else None,
+            "option_bid": quote.get("option_bid") if quote else None,
+            "option_ask": quote.get("option_ask") if quote else None,
+            "quote_ts": quote.get("quote_ts") if quote else None,
+            "tradability_bucket": quote.get("tradability_bucket") if quote else None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+        }
         if symbol in self.active_positions:
             del self.active_positions[symbol]
         await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
         await self._append_persistence_event(symbol, msg)
         await self.redis.publish("nexus_live_overlay:updates", symbol)
         self._log("position_liquidated", symbol=symbol, reason=reason, return_pct=round(float(ret), 4))
+
+    def _quote_from_payload(self, symbol: str, raw_symbol: str | None, payload: dict) -> dict:
+        return {
+            "symbol": symbol,
+            "raw_symbol": raw_symbol or payload.get("raw_symbol") or payload.get("rawSymbol"),
+            "option_mid": float(payload.get("option_mid") or 0.0),
+            "option_bid": _payload_float(payload, "option_bid", "bid"),
+            "option_ask": _payload_float(payload, "option_ask", "ask"),
+            "quote_ts": _payload_value(payload, "quote_ts_utc", "option_mid_ts_utc", "option_quote_ts_utc", "ts_utc"),
+            "tradability_bucket": _payload_value(payload, "tradability_bucket", "tradabilityBucket"),
+        }
+
+    async def _active_position_quote(self, symbol: str, position: dict, payload: dict) -> dict:
+        tracked_raw_symbol = normalize_raw_symbol(position.get("raw_symbol"))
+        if not tracked_raw_symbol:
+            return self._quote_from_payload(symbol, None, payload)
+
+        payload_raw_symbol = normalize_raw_symbol(payload.get("raw_symbol") or payload.get("rawSymbol"))
+        if payload_raw_symbol == tracked_raw_symbol:
+            return self._quote_from_payload(symbol, tracked_raw_symbol, payload)
+
+        state_key = CONTRACT_STATE_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=tracked_raw_symbol)
+        tradability_key = CONTRACT_TRADABILITY_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=tracked_raw_symbol)
+        contract_state, tradability = await asyncio.gather(
+            read_json_payload(self.redis, state_key),
+            read_json_payload(self.redis, tradability_key),
+        )
+        exact_payload = {"symbol": symbol, "raw_symbol": tracked_raw_symbol}
+        _merge_contract_payload(exact_payload, contract_state)
+        _merge_contract_payload(exact_payload, tradability)
+        return self._quote_from_payload(symbol, tracked_raw_symbol, exact_payload)
 
     async def evaluate_strategy(self, symbol, slot: dict, event_dt_utc: datetime):
         session_date = ny_session_date(event_dt_utc)
@@ -1296,23 +1367,18 @@ class SigmatiqNexus:
         self._current_window_df = pl.DataFrame()
         self._current_window_pricing_summary = {}
 
-    def _get_lead_price(self, df: pl.DataFrame, sentiment: str) -> float:
+    def _get_lead_contract_quote(self, df: pl.DataFrame, sentiment: str) -> tuple[str | None, float]:
         side = "C" if sentiment == "BULLISH" else "P"
         side_df = df.filter(pl.col("side").cast(pl.Utf8).str.to_uppercase() == side)
-        if side_df.is_empty(): return 0.0
+        if side_df.is_empty():
+            return None, 0.0
         lead = side_df.group_by("raw_symbol").agg(pl.col("premium").cast(pl.Float64, strict=False).fill_null(0).sum().alias("tp")).sort("tp", descending=True).head(1)
-        if lead.is_empty(): return 0.0
+        if lead.is_empty():
+            return None, 0.0
         price_col = "option_mid" if "option_mid" in df.columns else "price"
-        return float(side_df.filter(pl.col("raw_symbol") == lead[0, "raw_symbol"]).tail(1).select(pl.col(price_col)).item() or 0.0)
-
-    def _get_lead_price(self, df: pl.DataFrame, sentiment: str) -> float:
-        side = "C" if sentiment == "BULLISH" else "P"
-        side_df = df.filter(pl.col("side").cast(pl.Utf8).str.to_uppercase() == side)
-        if side_df.is_empty(): return 0.0
-        lead = side_df.group_by("raw_symbol").agg(pl.col("premium").cast(pl.Float64, strict=False).fill_null(0).sum().alias("tp")).sort("tp", descending=True).head(1)
-        if lead.is_empty(): return 0.0
-        price_col = "option_mid" if "option_mid" in df.columns else "price"
-        return float(side_df.filter(pl.col("raw_symbol") == lead[0, "raw_symbol"]).tail(1).select(pl.col(price_col)).item() or 0.0)
+        raw_symbol = lead[0, "raw_symbol"]
+        price = float(side_df.filter(pl.col("raw_symbol") == raw_symbol).tail(1).select(pl.col(price_col)).item() or 0.0)
+        return raw_symbol, price
 
     async def evaluate_confluence_sniper(self, df, symbol, slot: dict, session_date):
         strategy = "etf_confluence_sniper"
@@ -1328,9 +1394,9 @@ class SigmatiqNexus:
         if pricing_lag is None or pricing_lag > -0.05:
             self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="pricing_lag_not_cheap_enough", pricing_lag=pricing_lag, sentiment=sentiment, **self._window_log_fields(df, slot))
             return
-        price = self._get_lead_price(df, sentiment)
-        await self._publish_intermediate(strategy, symbol, sentiment, slot)
-        await self._publish_final(strategy, symbol, sentiment, 1.0, price, session_date, slot)
+        lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
+        await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date, lead_raw_symbol)
+        await self._publish_final(strategy, symbol, sentiment, 1.0, price, session_date, slot, lead_raw_symbol)
 
     async def assess_confluence_window(self, df, symbol, slot: dict):
         sentiment, valid, _ = await self.check_momentum_heuristics(df, symbol)
@@ -1392,9 +1458,9 @@ class SigmatiqNexus:
             return
         sentiment, valid = await self.check_open_specialist_heuristic(df, symbol, slot)
         if valid:
-            price = self._get_lead_price(df, sentiment)
-            await self._publish_intermediate(strategy, symbol, sentiment, slot)
-            await self._publish_final(strategy, symbol, sentiment, 0.95, price, session_date, slot)
+            lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
+            await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date, lead_raw_symbol)
+            await self._publish_final(strategy, symbol, sentiment, 0.95, price, session_date, slot, lead_raw_symbol)
         else:
             iv_rank, _, _ = await self.get_context(symbol)
             self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="open_specialist_heuristic_not_met", iv_rank=round(iv_rank, 4), **self._window_log_fields(df, slot))
@@ -1431,9 +1497,9 @@ class SigmatiqNexus:
             return
         sentiment, valid = await self.calculate_low_sweep_heuristic(df, slot)
         if valid:
-            price = self._get_lead_price(df, sentiment)
-            await self._publish_intermediate(strategy, symbol, sentiment, slot)
-            await self._publish_final(strategy, symbol, sentiment, 1.0, price, session_date, slot)
+            lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
+            await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date, lead_raw_symbol)
+            await self._publish_final(strategy, symbol, sentiment, 1.0, price, session_date, slot, lead_raw_symbol)
         else:
             self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="low_sweep_heuristic_not_met", **self._window_log_fields(df, slot))
 
@@ -1471,11 +1537,11 @@ class SigmatiqNexus:
             return
         sentiment, valid = await self.check_flow_heuristics(df, symbol, slot)
         if valid:
-            await self._publish_intermediate(strategy, symbol, sentiment, slot)
+            await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date)
             prob = await self.predict_v6(df, symbol)
             if prob > 0.45:
-                price = self._get_lead_price(df, sentiment)
-                await self._publish_final(strategy, symbol, sentiment, prob, price, session_date, slot)
+                lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
+                await self._publish_final(strategy, symbol, sentiment, prob, price, session_date, slot, lead_raw_symbol)
             else:
                 self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="v6_probability_below_threshold", probability=round(prob, 4), sentiment=sentiment, **self._window_log_fields(df, slot))
         else:
@@ -1508,11 +1574,11 @@ class SigmatiqNexus:
             return
         sentiment, valid, p_feat = await self.check_momentum_heuristics(df, symbol)
         if valid:
-            await self._publish_intermediate(strategy, symbol, sentiment, slot)
+            await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date)
             prob = await self.predict_v10(df, symbol, p_feat)
             if prob > 0.55:
-                price = self._get_lead_price(df, sentiment)
-                await self._publish_final(strategy, symbol, sentiment, prob, price, session_date, slot)
+                lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
+                await self._publish_final(strategy, symbol, sentiment, prob, price, session_date, slot, lead_raw_symbol)
             else:
                 self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="v10_probability_below_threshold", probability=round(prob, 4), sentiment=sentiment, price_features=p_feat, **self._window_log_fields(df, slot))
         else:
@@ -1581,15 +1647,35 @@ class SigmatiqNexus:
         exp_logits = np.exp(logits[0] - np.max(logits[0]))
         return float(exp_logits[1] / np.sum(exp_logits))
 
-    async def _publish_intermediate(self, strategy, symbol, sentiment, slot: dict | None = None):
-        msg = {"strategy": strategy, "symbol": symbol, "stage": 1, "sentiment": sentiment, "timestamp": datetime.now(timezone.utc).isoformat(), "source": "sigmatiq_nexus"}
+    async def _publish_intermediate(self, strategy, symbol, sentiment, slot: dict | None = None, session_date=None, raw_symbol: str | None = None):
+        signal_id = build_signal_id(strategy, symbol, session_date, slot, raw_symbol)
+        msg = {
+            "message_id": new_message_id(),
+            "signal_id": signal_id,
+            "position_id": signal_id,
+            "strategy": strategy,
+            "symbol": symbol,
+            "stage": 1,
+            "decision": "INTERMEDIATE",
+            "sentiment": sentiment,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+        }
+        if raw_symbol:
+            msg["raw_symbol"] = raw_symbol
         if slot:
             msg.update({"entry_time": slot["entry_label"], "window_start": slot["window_start"].isoformat(), "window_end": slot["window_end"].isoformat()})
-        await self._append_persistence_event(symbol, msg)
+        if session_date:
+            msg["session_date"] = str(session_date)
+        entry_label = slot["entry_label"] if slot else "na"
+        redis_key = f"nexus_intermediate:{symbol}:{strategy}:{entry_label}"
+        await self.redis.set(redis_key, json.dumps(msg))
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self.redis.publish("nexus_intermediate:updates", symbol)
         await self.redis.publish(f"signal:intermediate:{strategy}", json.dumps(msg))
         self._log("strategy_intermediate_published", strategy=strategy, symbol=symbol, sentiment=sentiment, entry_time=slot["entry_label"] if slot else None)
 
-    async def _publish_final(self, strategy: str, symbol: str, sentiment: str, confidence: float, entry_price: float = 0.0, session_date=None, slot: dict | None = None):
+    async def _publish_final(self, strategy: str, symbol: str, sentiment: str, confidence: float, entry_price: float = 0.0, session_date=None, slot: dict | None = None, raw_symbol: str | None = None):
         # --- TOURNAMENT WHITELIST CHECK (Best Practical Combo) ---
         # Exclude: SPY open calls and QQQ momentum puts
         # Use: QQQ open calls, QQQ flow calls/puts, QQQ momentum calls, SPY flow calls/puts, SPY momentum calls/puts
@@ -1607,11 +1693,38 @@ class SigmatiqNexus:
             slot = session_date
             session_date = entry_price
             entry_price = 0.0
-        msg = {"strategy": strategy, "symbol": symbol, "stage": 2, "decision": "BET", "sentiment": sentiment, "confidence": float(confidence), "entry_price": entry_price, "timestamp": datetime.now(timezone.utc).isoformat(), "source": "sigmatiq_nexus"}
+        signal_id = build_signal_id(strategy, symbol, session_date, slot, raw_symbol)
+        msg = {
+            "message_id": new_message_id(),
+            "signal_id": signal_id,
+            "position_id": signal_id,
+            "strategy": strategy,
+            "symbol": symbol,
+            "stage": 2,
+            "decision": "BET",
+            "sentiment": sentiment,
+            "confidence": float(confidence),
+            "entry_price": entry_price,
+            "risk": {
+                "stop_loss_pct": STOP_LOSS_PCT,
+                "guard_activate_pct": GUARD_ACTIVATE_PCT,
+                "guard_floor_pct": GUARD_FLOOR_PCT,
+                "policy": "stop_loss_plus_breakeven_guard",
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "sigmatiq_nexus",
+        }
         if session_date:
             msg["session_date"] = str(session_date)
         if slot:
             msg.update({"entry_time": slot["entry_label"], "window_start": slot["window_start"].isoformat(), "window_end": slot["window_end"].isoformat()})
+        if raw_symbol:
+            msg["raw_symbol"] = raw_symbol
+            msg.update({k: v for k, v in {
+                "expiry_date": _contract_details_from_raw_symbol(raw_symbol)["expiry_date"],
+                "strike": _contract_details_from_raw_symbol(raw_symbol)["strike"],
+                "option_side": _contract_details_from_raw_symbol(raw_symbol)["side"],
+            }.items() if v is not None})
         key_date = session_date or ny_session_date(datetime.now(timezone.utc))
         self.signaled_today.add(symbol_lane_key(key_date, symbol))
         if FIRST_TRIGGER_SCOPE == "strategy":
@@ -1625,7 +1738,14 @@ class SigmatiqNexus:
             active_positions = {}
             self.active_positions = active_positions
         if entry_price > 0:
-            active_positions[symbol] = {'entry_price': entry_price, 'is_guarded': False, 'side': sentiment}
+            active_positions[symbol] = {
+                'entry_price': entry_price,
+                'is_guarded': False,
+                'side': sentiment,
+                'raw_symbol': raw_symbol,
+                'signal_id': signal_id,
+                'position_id': signal_id,
+            }
 
         await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
         await self._append_persistence_event(symbol, msg)
