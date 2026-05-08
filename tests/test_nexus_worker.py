@@ -263,6 +263,8 @@ def test_cluster_connection_does_not_disable_tls_verification():
     text = open("src/sigmatiq_nexus/nexus_worker.py", encoding="utf-8").read()
 
     assert "ssl_cert_reqs=None" not in text
+    assert "ssl_cert_reqs\": ssl.CERT_REQUIRED" in text
+    assert "ssl_check_hostname\": False" in text
 
 
 def test_default_symbols_and_scope_cover_combined_etf_sniper():

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import ssl
 from collections import deque
 from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import quote, urlparse
@@ -1146,15 +1147,19 @@ class SigmatiqNexus:
         await self.restore_active_positions()
 
     def _connect_cluster(self, value: str):
+        # Azure Redis Cluster can redirect slots to node IPs while the TLS
+        # certificate is issued for the managed hostname. Keep certificate-chain
+        # validation enabled, but disable hostname matching for redirected IPs.
+        tls_kwargs = {"ssl_cert_reqs": ssl.CERT_REQUIRED, "ssl_check_hostname": False}
         if value.startswith("redis://") or value.startswith("rediss://"):
-            return RedisCluster.from_url(value, decode_responses=False)
+            return RedisCluster.from_url(value, decode_responses=False, **tls_kwargs)
         if ",password=" in value:
             host, rest = value.split(",", 1)
             password = rest.split("password=", 1)[1].split(",", 1)[0]
             hostname, port = host.rsplit(":", 1)
-            return RedisCluster(host=hostname, port=int(port), password=password, ssl=True, decode_responses=False)
+            return RedisCluster(host=hostname, port=int(port), password=password, ssl=True, decode_responses=False, **tls_kwargs)
         parsed = urlparse(value)
-        return RedisCluster(host=parsed.hostname, port=parsed.port or 6379, password=parsed.password, ssl=parsed.scheme == "rediss", decode_responses=False)
+        return RedisCluster(host=parsed.hostname, port=parsed.port or 6379, password=parsed.password, ssl=parsed.scheme == "rediss", decode_responses=False, **tls_kwargs)
 
     def _redis_url(self, value: str) -> str:
         if value.startswith("redis://") or value.startswith("rediss://"):
