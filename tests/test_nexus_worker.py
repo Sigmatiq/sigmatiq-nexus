@@ -1903,3 +1903,126 @@ def test_publish_participant_flow_context_dedup_guard():
     asyncio.run(worker.publish_participant_flow_context_for_slot("SPY", slot, date(2026, 5, 8)))
     # Second call should be a no-op
     assert len(worker.redis.sets) == first_set_count
+
+
+# ---------------------------------------------------------------------------
+# etf_allday_specialist — tests
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_allday_alert_publishes_intermediate_and_final():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:contract_state:SPY260508C00560000": json.dumps({
+            "optionMid": 5.0, "bid": 4.90, "ask": 5.10,
+            "asOfUtc": "2026-05-08T14:15:00Z", "quoteAgeMs": 100,
+            "tradable": True, "executable": True, "tradabilityBucket": "tradable",
+        }),
+        "options:live:vrp:SPY": json.dumps({"ivRank": 22.0, "asOf": "2026-05-08T14:15:00Z"}),
+    })
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.buffers = {"SPY": deque(maxlen=100)}
+    worker.buffers["SPY"].extend([
+        {
+            "ts_utc": "2026-05-08T14:10:00Z",
+            "symbol": "SPY",
+            "raw_symbol": "SPY260508C00560000",
+            "side": "C",
+            "premium": 300_000.0,
+            "is_sweep": True,
+            "aggressor": "A",
+            "delta": 0.5,
+            "option_mid": 5.0,
+            "option_bid": 4.90,
+            "option_ask": 5.10,
+            "underlying_mid": 560.0,
+        },
+    ])
+    worker.last_reset_session_date = date(2026, 5, 8)
+    worker.feature_blocks_reported = set()
+    worker.window_views_reported = set()
+    worker.window_pricing_reported = set()
+    worker.option_market_context_reported = set()
+    worker.participant_flow_reported = set()
+    worker.evaluated_windows = set()
+    worker.late_window_impacts = {}
+
+    signal = {
+        "symbol": "SPY",
+        "direction": "BULLISH",
+        "horizon": "0DTE",
+        "session_date": "2026-05-08",
+        "timestamp": "2026-05-08T14:15:00+00:00",
+    }
+
+    asyncio.run(worker.evaluate_allday_alert(signal))
+
+    # Should have published intermediate + final (SET + XADD + PUBLISH each)
+    keys_set = [s[0] for s in worker.redis.sets]
+    assert any("nexus_intermediate:SPY:etf_allday_specialist" in k for k in keys_set)
+
+
+def test_evaluate_allday_alert_ignores_wrong_symbol():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.buffers = {}
+    worker.last_reset_session_date = date(2026, 5, 8)
+
+    signal = {"symbol": "AAPL", "direction": "BULLISH", "horizon": "0DTE", "session_date": "2026-05-08"}
+    asyncio.run(worker.evaluate_allday_alert(signal))
+    assert len(worker.redis.sets) == 0
+
+
+def test_evaluate_allday_alert_ignores_wrong_horizon():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.buffers = {"SPY": deque(maxlen=100)}
+    worker.last_reset_session_date = date(2026, 5, 8)
+
+    signal = {"symbol": "SPY", "direction": "BULLISH", "horizon": "2W", "session_date": "2026-05-08"}
+    asyncio.run(worker.evaluate_allday_alert(signal))
+    assert len(worker.redis.sets) == 0
+
+
+def test_evaluate_allday_alert_respects_session_lock():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:contract_state:SPY260508C00560000": json.dumps({
+            "optionMid": 5.0, "bid": 4.90, "ask": 5.10,
+            "asOfUtc": "2026-05-08T14:15:00Z", "quoteAgeMs": 100,
+            "tradable": True, "executable": True, "tradabilityBucket": "tradable",
+        }),
+        "options:live:vrp:SPY": json.dumps({"ivRank": 22.0, "asOf": "2026-05-08T14:15:00Z"}),
+    })
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.buffers = {"SPY": deque(maxlen=100)}
+    worker.buffers["SPY"].append({
+        "ts_utc": "2026-05-08T14:10:00Z", "symbol": "SPY", "raw_symbol": "SPY260508C00560000",
+        "side": "C", "premium": 300_000.0, "is_sweep": True, "aggressor": "A",
+        "delta": 0.5, "option_mid": 5.0, "option_bid": 4.90, "option_ask": 5.10, "underlying_mid": 560.0,
+    })
+    worker.last_reset_session_date = date(2026, 5, 8)
+    worker.feature_blocks_reported = set()
+    worker.window_views_reported = set()
+    worker.window_pricing_reported = set()
+    worker.option_market_context_reported = set()
+    worker.participant_flow_reported = set()
+    worker.evaluated_windows = set()
+    worker.late_window_impacts = {}
+
+    signal = {"symbol": "SPY", "direction": "BULLISH", "horizon": "0DTE", "session_date": "2026-05-08"}
+
+    # First call should publish
+    asyncio.run(worker.evaluate_allday_alert(signal))
+    first_count = len(worker.redis.sets)
+    assert first_count > 0
+
+    # Second call should be locked
+    asyncio.run(worker.evaluate_allday_alert(signal))
+    assert len(worker.redis.sets) == first_count

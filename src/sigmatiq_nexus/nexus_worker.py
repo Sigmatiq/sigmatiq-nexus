@@ -73,6 +73,12 @@ SPREAD_STOP_LOSS_PCT = float(os.environ.get("NEXUS_SPREAD_STOP_LOSS_PCT", "75.0"
 SPREAD_HOLD_SECONDS = int(os.environ.get("NEXUS_SPREAD_HOLD_SECONDS", "1800"))
 SPREAD_MAX_IV_RANK = float(os.environ.get("NEXUS_SPREAD_MAX_IV_RANK", "30.0"))
 
+# --- ALL-DAY SPECIALIST (external alert signals) ---
+ALLDAY_ENABLED = os.environ.get("NEXUS_ALLDAY_ENABLED", "false").strip().lower() == "true"
+ALLDAY_STREAM = os.environ.get("NEXUS_ALLDAY_STREAM", "signal:alert:stream")
+ALLDAY_CONSUMER_GROUP = os.environ.get("NEXUS_ALLDAY_CONSUMER_GROUP", "nexus-allday")
+ALLDAY_HORIZONS = {h.strip() for h in os.environ.get("NEXUS_ALLDAY_HORIZONS", "0DTE").split(",") if h.strip()}
+
 MODEL_V6_PATH = os.environ.get("NEXUS_V6_MODEL", "models/hybrid_spy_v6.onnx")
 SCALER_V6_PATH = os.environ.get("NEXUS_V6_SCALER", "models/hybrid_scaler_v6.npz")
 MODEL_V10_PATH = os.environ.get("NEXUS_V10_MODEL", "models/alpha_fusion_spy_v10.onnx")
@@ -216,6 +222,7 @@ STRATEGY_REQUIRED_FEATURES = {
         "option_mid",
         "iv_rank",
     ),
+    "etf_allday_specialist": ("ts_utc", "symbol", "side", "premium"),
 }
 
 
@@ -1238,6 +1245,8 @@ class SigmatiqNexus:
                             await self.process_message(data)
                             await self.persist_stream_offset(stream_name, msg_id)
                 await self.evaluate_due_windows(datetime.now(timezone.utc))
+                if ALLDAY_ENABLED:
+                    await self.poll_allday_alerts()
             except Exception as e:
                 self._log("main_loop_error", error=str(e))
                 await asyncio.sleep(1)
@@ -1292,6 +1301,106 @@ class SigmatiqNexus:
             restored += 1
         if restored:
             self._log("active_positions_restored", session_date=str(session_date), count=restored)
+
+    async def _ensure_allday_consumer_group(self):
+        try:
+            await self.redis.xgroup_create(ALLDAY_STREAM, ALLDAY_CONSUMER_GROUP, id="0-0", mkstream=True)
+        except Exception as exc:
+            if "BUSYGROUP" not in str(exc):
+                self._log("allday_consumer_group_create_failed", error=str(exc))
+
+    async def poll_allday_alerts(self):
+        """Read directional alert signals from signal:alert:stream and evaluate."""
+        await self._ensure_allday_consumer_group()
+        try:
+            entries = await self.redis.xreadgroup(
+                ALLDAY_CONSUMER_GROUP,
+                f"nexus-{os.getpid()}",
+                {ALLDAY_STREAM: ">"},
+                count=10,
+            )
+        except Exception as exc:
+            self._log("allday_stream_read_failed", error=str(exc))
+            return
+
+        for stream, messages in entries:
+            for msg_id, data in messages:
+                try:
+                    payload_raw = data.get(b"payload") or data.get("payload")
+                    if not payload_raw:
+                        await self.redis.xack(ALLDAY_STREAM, ALLDAY_CONSUMER_GROUP, msg_id)
+                        continue
+                    if isinstance(payload_raw, bytes):
+                        payload_raw = payload_raw.decode("utf-8")
+                    signal = json.loads(payload_raw)
+                    await self.evaluate_allday_alert(signal)
+                except Exception as exc:
+                    self._log("allday_alert_process_failed", error=str(exc))
+                await self.redis.xack(ALLDAY_STREAM, ALLDAY_CONSUMER_GROUP, msg_id)
+
+    async def evaluate_allday_alert(self, signal: dict):
+        """Evaluate a directional alert signal and publish BET if conditions met."""
+        strategy = "etf_allday_specialist"
+        symbol = str(signal.get("symbol") or "").strip().upper()
+        direction = str(signal.get("direction") or "").strip().upper()
+        horizon = str(signal.get("horizon") or "").strip().upper()
+        session_date_str = signal.get("session_date") or str(ny_session_date(datetime.now(timezone.utc)))
+
+        if symbol not in SYMBOLS:
+            self._log("allday_alert_ignored_symbol", symbol=symbol, reason="not_in_nexus_symbols")
+            return
+        if horizon not in ALLDAY_HORIZONS:
+            self._log("allday_alert_ignored_horizon", symbol=symbol, horizon=horizon, reason="horizon_not_enabled")
+            return
+        if direction not in ("BULLISH", "BEARISH"):
+            self._log("allday_alert_ignored_direction", symbol=symbol, direction=direction, reason="invalid_direction")
+            return
+
+        session_date = date.fromisoformat(session_date_str)
+        self.reset_if_new_session(datetime.now(timezone.utc))
+
+        if self.already_signaled(session_date, symbol, strategy):
+            self._log("allday_alert_already_signaled", symbol=symbol, session_date=session_date_str)
+            return
+
+        sentiment = direction
+        # Find lead contract from current buffer
+        if symbol not in self.buffers or not self.buffers[symbol]:
+            self._log("allday_alert_no_buffer", symbol=symbol, reason="no_trade_buffer_for_symbol")
+            return
+
+        df = pl.DataFrame(list(self.buffers[symbol]))
+        if df.is_empty():
+            self._log("allday_alert_empty_buffer", symbol=symbol)
+            return
+
+        lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
+        if not lead_raw_symbol:
+            self._log("allday_alert_no_lead_contract", symbol=symbol, sentiment=sentiment)
+            return
+
+        # Build a synthetic slot for the alert time
+        now = datetime.now(timezone.utc)
+        ny_time = now.astimezone(NY).time()
+        alert_slot = {
+            "entry": ny_time,
+            "end": ny_time,
+            "window_start": time(9, 30),
+            "window_end": ny_time,
+            "entry_label": f"allday_{ny_time.strftime('%H%M')}",
+        }
+
+        await self._publish_intermediate(strategy, symbol, sentiment, alert_slot, session_date, lead_raw_symbol)
+        await self._publish_final(strategy, symbol, sentiment, 0.80, price, session_date, alert_slot, lead_raw_symbol)
+        self._log(
+            "allday_alert_evaluated",
+            symbol=symbol,
+            direction=direction,
+            horizon=horizon,
+            sentiment=sentiment,
+            lead_raw_symbol=lead_raw_symbol,
+            session_date=session_date_str,
+        )
 
     async def _acquire_final_locks(self, session_date, symbol: str, strategy: str, signal_id: str) -> bool:
         lock_specs = [(redis_symbol_lock_key(session_date, symbol), symbol_lane_key(session_date, symbol))]
