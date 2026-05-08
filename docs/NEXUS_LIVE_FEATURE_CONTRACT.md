@@ -64,6 +64,8 @@ Current window-completion semantics:
 - the scheduler checks due windows on every stream loop and after each processed event
 - a slot is due when `slot.entry + NEXUS_WINDOW_EVALUATION_GRACE_SECONDS` has passed in New York time
 - each window evaluates once per session/symbol/entry label
+- window assignment is session-date aware; same clock-time rows from prior sessions must not satisfy today's window
+- if the in-memory buffer has no rows for a due slot, Nexus falls back to the raw Redis option stream and scans the latest `NEXUS_STREAM_WINDOW_LOOKBACK_COUNT` entries before declaring `empty_window`
 - this is safer than first-event-after-boundary evaluation, but it is still not a true upstream ingestion watermark
 
 ## Feature Availability Summary

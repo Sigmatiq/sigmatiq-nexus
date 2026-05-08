@@ -41,6 +41,7 @@ STREAM_OFFSET_KEY_TEMPLATE = os.environ.get("NEXUS_STREAM_OFFSET_KEY", "nexus:st
 LOCK_TTL_SECONDS = int(os.environ.get("NEXUS_LOCK_TTL_SECONDS", str(60 * 60 * 8)))
 ACTIVE_POSITION_TTL_SECONDS = int(os.environ.get("NEXUS_ACTIVE_POSITION_TTL_SECONDS", str(60 * 60 * 8)))
 WINDOW_EVALUATION_GRACE_SECONDS = int(os.environ.get("NEXUS_WINDOW_EVALUATION_GRACE_SECONDS", "15"))
+STREAM_WINDOW_LOOKBACK_COUNT = int(os.environ.get("NEXUS_STREAM_WINDOW_LOOKBACK_COUNT", "20000"))
 
 IV_RANK_KEY_TEMPLATE = os.environ.get("NEXUS_IV_RANK_KEY", "stats:{symbol}:iv_rank")
 ATM_IV_KEY_TEMPLATE = os.environ.get("NEXUS_ATM_IV_KEY", "stats:{symbol}:atm_iv")
@@ -368,6 +369,10 @@ def input_streams() -> dict[str, str]:
     if INPUT_STREAM:
         return {INPUT_STREAM: STREAM_START_ID}
     return {f"md:{symbol}:options:trades": STREAM_START_ID for symbol in sorted(SYMBOLS)}
+
+
+def input_stream_for_symbol(symbol: str) -> str:
+    return INPUT_STREAM or f"md:{symbol}:options:trades"
 
 
 async def read_input_streams(redis_client, streams: dict[str, str]):
@@ -753,13 +758,19 @@ def decode_stream_entry(data: dict) -> dict:
     return normalize_trade_payload(data)
 
 
-def window_df_for_slot(df: pl.DataFrame, slot: dict) -> pl.DataFrame:
+def window_df_for_slot(df: pl.DataFrame, slot: dict, session_date: date | None = None) -> pl.DataFrame:
     if df.is_empty() or "ts_utc" not in df.columns:
         return df.clear()
     ts_expr = pl.col("ts_utc") if df.schema["ts_utc"].is_temporal() else pl.col("ts_utc").str.to_datetime(strict=False, time_zone="UTC")
     with_ts = df.with_columns(ts_expr.alias("_dt_utc"))
-    with_ts = with_ts.with_columns(pl.col("_dt_utc").dt.convert_time_zone("America/New_York").dt.time().alias("_time_ny"))
-    return with_ts.filter((pl.col("_time_ny") >= slot["window_start"]) & (pl.col("_time_ny") < slot["window_end"]))
+    with_ts = with_ts.with_columns([
+        pl.col("_dt_utc").dt.convert_time_zone("America/New_York").dt.time().alias("_time_ny"),
+        pl.col("_dt_utc").dt.convert_time_zone("America/New_York").dt.date().alias("_date_ny"),
+    ])
+    filter_expr = (pl.col("_time_ny") >= slot["window_start"]) & (pl.col("_time_ny") < slot["window_end"])
+    if session_date is not None:
+        filter_expr = filter_expr & (pl.col("_date_ny") == session_date)
+    return with_ts.filter(filter_expr)
 
 
 def window_stats(df: pl.DataFrame) -> dict:
@@ -1626,7 +1637,7 @@ class SigmatiqNexus:
             self._log("window_skipped", symbol=symbol, session_date=str(session_date), reason="iv_rank_below_floor", iv_rank=iv_rank, entry_time=slot["entry_label"])
             return
 
-        slot_df = window_df_for_slot(pl.DataFrame(list(self.buffers[symbol])), slot)
+        slot_df = await self._window_df_for_symbol(symbol, slot, session_date)
         if slot_df.height == 0:
             self._log("window_skipped", symbol=symbol, session_date=str(session_date), reason="empty_window", entry_time=slot["entry_label"])
             return
@@ -1661,6 +1672,51 @@ class SigmatiqNexus:
             await self.evaluate_flow_specialist(slot_df, symbol, slot, session_date)
         if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "11:00":
             await self.evaluate_momentum_specialist(slot_df, symbol, slot, session_date)
+
+    async def _window_df_for_symbol(self, symbol: str, slot: dict, session_date) -> pl.DataFrame:
+        buffer_df = window_df_for_slot(pl.DataFrame(list(self.buffers.get(symbol, []))), slot, session_date)
+        if not buffer_df.is_empty():
+            return buffer_df
+        stream_df = await self._window_df_from_stream(symbol, slot, session_date)
+        if not stream_df.is_empty():
+            self._log(
+                "window_stream_fallback_used",
+                symbol=symbol,
+                session_date=str(session_date),
+                entry_time=slot["entry_label"],
+                stream=input_stream_for_symbol(symbol),
+                row_count=stream_df.height,
+            )
+        return stream_df
+
+    async def _window_df_from_stream(self, symbol: str, slot: dict, session_date) -> pl.DataFrame:
+        if not self.redis:
+            return pl.DataFrame()
+        rows = []
+        try:
+            entries = await self.redis.xrevrange(
+                input_stream_for_symbol(symbol),
+                count=STREAM_WINDOW_LOOKBACK_COUNT,
+            )
+        except Exception as exc:
+            self._log(
+                "window_stream_fallback_failed",
+                symbol=symbol,
+                session_date=str(session_date),
+                entry_time=slot["entry_label"],
+                error=str(exc),
+            )
+            return pl.DataFrame()
+        for _, data in entries:
+            try:
+                payload = decode_stream_entry(data)
+            except Exception:
+                continue
+            if str(payload.get("symbol") or "").strip().upper() == symbol:
+                rows.append(payload)
+        if not rows:
+            return pl.DataFrame()
+        return window_df_for_slot(pl.DataFrame(rows), slot, session_date)
 
     def already_signaled(self, session_date, symbol: str, strategy: str) -> bool:
         if symbol_lane_key(session_date, symbol) in self.signaled_today:
@@ -1932,9 +1988,7 @@ class SigmatiqNexus:
         reported = getattr(self, "option_market_context_reported", set())
         if key in reported:
             return
-        if symbol not in self.buffers:
-            return
-        df = window_df_for_slot(pl.DataFrame(list(self.buffers[symbol])), slot)
+        df = await self._window_df_for_symbol(symbol, slot, session_date)
         if df.is_empty():
             return
         reported.add(key)
@@ -1960,9 +2014,7 @@ class SigmatiqNexus:
         reported = getattr(self, "participant_flow_reported", set())
         if key in reported:
             return
-        if symbol not in self.buffers:
-            return
-        df = window_df_for_slot(pl.DataFrame(list(self.buffers[symbol])), slot)
+        df = await self._window_df_for_symbol(symbol, slot, session_date)
         if df.is_empty():
             return
         msg = pf.build_participant_flow_payload(df, symbol, slot, session_date, pf.PARTICIPANT_FLOW_DEFAULT_CONFIG)

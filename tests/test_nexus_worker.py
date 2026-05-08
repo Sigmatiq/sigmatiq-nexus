@@ -56,6 +56,18 @@ def test_window_df_for_slot_uses_completed_window_not_current_tick_window():
     assert filtered["premium"].sum() == 225_000
 
 
+def test_window_df_for_slot_filters_session_date():
+    df = pl.DataFrame([
+        row("2026-05-04T13:35:00Z", "C", 999_000),
+        row("2026-05-05T13:35:00Z", "C", 150_000),
+    ])
+
+    filtered = nw.window_df_for_slot(df, nw.DECISION_SLOTS[0], date(2026, 5, 5))
+
+    assert filtered.height == 1
+    assert filtered["premium"].sum() == 150_000
+
+
 def test_window_stats_normalizes_option_side_case():
     df = pl.DataFrame([
         row("2026-05-05T13:35:00Z", "c", 300_000),
@@ -336,6 +348,7 @@ class FakeRedis:
         self.sets = []
         self.publishes = []
         self.xadds = []
+        self.xrevranges = {}
 
     async def get(self, key):
         return self.values.get(key)
@@ -357,6 +370,9 @@ class FakeRedis:
     async def xadd(self, name, fields, maxlen=None, approximate=True):
         self.xadds.append((name, fields, maxlen, approximate))
         return "1-0"
+
+    async def xrevrange(self, name, count=None):
+        return self.xrevranges.get(name, [])[:count]
 
 
 class FakeXReadRedis:
@@ -385,6 +401,41 @@ def test_publish_falls_back_to_execute_command_for_cluster_client():
     asyncio.run(worker._publish("signal:test", "payload"))
 
     assert worker.redis.commands == [("PUBLISH", "signal:test", "payload")]
+
+
+def test_window_df_for_symbol_falls_back_to_redis_stream_when_buffer_empty():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.buffers = {"SPY": deque()}
+    worker.redis = FakeRedis()
+    worker._log = lambda *args, **kwargs: None
+    stream_rows = [
+        {
+            "underlying": "SPY",
+            "raw_symbol": "SPY   260505C00720000",
+            "price": 10.0,
+            "size": 200,
+            "side": 65,
+            "ts_event_ns": int(datetime(2026, 5, 5, 13, 40, tzinfo=timezone.utc).timestamp() * 1_000_000_000),
+        },
+        {
+            "underlying": "SPY",
+            "raw_symbol": "SPY   260505P00710000",
+            "price": 5.0,
+            "size": 10,
+            "side": 65,
+            "ts_event_ns": int(datetime(2026, 5, 5, 14, 10, tzinfo=timezone.utc).timestamp() * 1_000_000_000),
+        },
+    ]
+    worker.redis.xrevranges["md:SPY:options:trades"] = [
+        (f"{idx}-0", {b"data": msgpack.packb(payload, use_bin_type=True)})
+        for idx, payload in enumerate(stream_rows)
+    ]
+
+    df = asyncio.run(worker._window_df_for_symbol("SPY", nw.DECISION_SLOTS[0], date(2026, 5, 5)))
+
+    assert df.height == 1
+    assert df["side"].to_list() == ["C"]
+    assert df["premium"].sum() == 200_000
 
 
 def test_cluster_mode_reads_each_input_stream_separately(monkeypatch):
