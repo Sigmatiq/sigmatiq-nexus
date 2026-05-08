@@ -2232,14 +2232,15 @@ class SigmatiqNexus:
         df = await self._window_df_for_symbol(symbol, slot, session_date)
         if df.is_empty():
             return
-        reported.add(key)
-        self.option_market_context_reported = reported
         msg = self._option_market_context_payload(df, symbol, slot, session_date)
         redis_key = f"nexus_option_market_context:{symbol}:{slot['entry_label']}"
-        await self.redis.set(redis_key, json.dumps(msg))
-        await self.redis.set(f"nexus_option_market_context:{symbol}:latest", json.dumps(msg))
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_option_market_context:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish("signal:option_market_context", json.dumps(msg))
+        # Mark reported only after all writes succeed so transient Redis errors can retry.
+        reported.add(key)
+        self.option_market_context_reported = reported
         self._log(
             "option_market_context_published",
             symbol=symbol,

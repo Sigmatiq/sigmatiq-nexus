@@ -398,8 +398,8 @@ Nexus also publishes a non-strategy market-context feed for `strategy-fit` and U
 
 | Artifact | Name | Notes |
 |---|---|---|
-| Completed-window key | `nexus_option_market_context:{symbol}:{window_id}` | Full payload for a completed 30-minute context window. |
-| Latest key | `nexus_option_market_context:{symbol}:latest` | Latest completed context window for API aggregation. |
+| Completed-window key | `nexus_option_market_context:{symbol}:{window_id}` | Full payload for a completed 30-minute context window; expires after 48 hours. |
+| Latest key | `nexus_option_market_context:{symbol}:latest` | Latest completed context window for API aggregation; expires after 8 hours. |
 | Pub/Sub | `signal:option_market_context` | Full payload for subscribers. |
 
 Market-context windows run every 30 minutes from `09:30-16:00` ET, plus optional `16:00-16:15`. Strategy decision slots remain limited to researched strategy windows. If the worker restarts mid-session, it resumes with the latest completed window rather than publishing a catch-up burst for all earlier windows.
@@ -432,10 +432,12 @@ Cheap/costly contract and side reads are only emitted when Nexus has point-in-ti
   - Audit-only payload for delayed trades that belong to an already evaluated window; includes late event count, raw symbol, side, and call/put premium impact
 - `OPTION_MARKET_CONTEXT`
   - Redis key: `nexus_option_market_context:{symbol}:{window_id}` and `nexus_option_market_context:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
   - Pub/Sub: `signal:option_market_context`
   - Full-session non-strategy market context for pricing and contract-activity consumers
 - `PARTICIPANT_FLOW_CONTEXT`
   - Redis key: `nexus_participant_flow_context:{symbol}:{window_key}` and `nexus_participant_flow_context:{symbol}:latest`
+  - TTL: completed-window keys expire after 48 hours; latest keys expire after 8 hours
   - Pub/Sub: `signal:participant_flow_context`
   - Full-session participant flow context for completed 30-minute windows
   - Includes `window_side_read`, `retail_like_flow`, `institutional_like_flow`, `dealer_inferred_pressure`, `dominant_strategy_shape`, `top_contracts`, and `data_quality`

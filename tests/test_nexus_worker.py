@@ -354,6 +354,7 @@ def test_default_symbols_and_scope_cover_combined_etf_sniper():
 class FakeRedis:
     def __init__(self, values=None):
         self.values = values or {}
+        self.expires = {}
         self.sets = []
         self.publishes = []
         self.xadds = []
@@ -366,6 +367,8 @@ class FakeRedis:
         if nx and key in self.values:
             return False
         self.values[key] = value
+        if ex is not None:
+            self.expires[key] = ex
         self.sets.append((key, value))
         return True
 
@@ -1654,6 +1657,8 @@ def test_publish_option_market_context_sets_latest_and_publishes():
     key = "nexus_option_market_context:SPY:w0930_1000"
     assert key in worker.redis.values
     assert "nexus_option_market_context:SPY:latest" in worker.redis.values
+    assert worker.redis.expires[key] == 48 * 3600
+    assert worker.redis.expires["nexus_option_market_context:SPY:latest"] == 8 * 3600
     msg = json.loads(worker.redis.values[key])
     assert msg["window_id"] == "w0930_1000"
     assert msg["premium"]["net_premium_bias"] == "call_heavy"
@@ -1665,6 +1670,44 @@ def test_publish_option_market_context_sets_latest_and_publishes():
     assert msg["pricing_quality_reason"] == "pricing_lag_range_too_small"
     assert worker.redis.xadds[0][1]["redis_key"] == key
     assert worker.redis.publishes[0][0] == "signal:option_market_context"
+    assert ("2026-05-05", "SPY", "w0930_1000") in worker.option_market_context_reported
+
+
+def test_publish_option_market_context_does_not_mark_reported_when_write_fails():
+    class FailingRedis(FakeRedis):
+        async def set(self, key, value, nx=False, ex=None):
+            raise RuntimeError("redis unavailable")
+
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FailingRedis()
+    worker.option_market_context_reported = set()
+    worker.late_window_impacts = {}
+    worker.buffers = {"SPY": deque(maxlen=10)}
+    worker.buffers["SPY"].append(
+        {
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00700000",
+            "side": "C",
+            "premium": 300_000.0,
+            "is_sweep": True,
+            "underlying_mid": 700.0,
+            "delta": 0.5,
+            "option_mid": 10.0,
+            "option_bid": 9.9,
+            "option_ask": 10.1,
+            "quote_ts_utc": "2026-05-05T13:35:00Z",
+        }
+    )
+
+    try:
+        asyncio.run(worker.publish_option_market_context_for_slot("SPY", nw.MARKET_CONTEXT_WINDOWS[0], date(2026, 5, 5)))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected Redis write failure")
+
+    assert ("2026-05-05", "SPY", "w0930_1000") not in worker.option_market_context_reported
 
 
 def test_late_event_after_window_evaluation_publishes_audit_event():
