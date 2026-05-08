@@ -225,21 +225,100 @@ def build_participant_flow_context_narrative(payload: dict) -> dict:
 
 
 def build_option_market_context_narrative(payload: dict) -> dict:
-    """Build narrative fields for an OPTION_MARKET_CONTEXT message.
+    """Build narrative fields for an OPTION_MARKET_CONTEXT message."""
+    premium = payload.get("premium") or {}
+    activity = payload.get("activity") or {}
+    cheap_side = payload.get("cheap_side", "unknown")
+    costly_side = payload.get("costly_side", "unknown")
+    liquidity_quality = payload.get("liquidity_quality", "unknown")
+    pricing_quality = payload.get("pricing_quality", "unknown")
+    cheapest = payload.get("cheapest_contracts") or []
+    most_traded = payload.get("most_traded_contracts") or []
 
-    TODO: Implement in step 3 per design doc.
-    """
-    return {
+    call_p = float(premium.get("call_premium") or 0)
+    put_p = float(premium.get("put_premium") or 0)
+    total_p = float(premium.get("total_premium") or 0)
+    bias = premium.get("net_premium_bias", "balanced")
+    trade_count = int(activity.get("trade_count") or 0)
+
+    # --- what_happened ---
+    what_happened = []
+
+    if total_p > 0:
+        what_happened.append(f"Total premium was {_fmt_premium(total_p)} across {trade_count} trades.")
+    if bias == "call_heavy" and put_p > 0:
+        what_happened.append(f"Call premium was {_fmt_ratio(call_p, put_p)} put premium.")
+    elif bias == "put_heavy" and call_p > 0:
+        what_happened.append(f"Put premium was {_fmt_ratio(put_p, call_p)} call premium.")
+
+    if most_traded:
+        top = most_traded[0]
+        what_happened.append(f"Most traded contract was {top.get('raw_symbol', 'unknown')}.")
+
+    if cheap_side not in ("unknown", "balanced"):
+        what_happened.append(f"Cheap side was {cheap_side}.")
+    if costly_side not in ("unknown", "balanced"):
+        what_happened.append(f"Costly side was {costly_side}.")
+
+    # --- what_it_means ---
+    what_it_means = []
+    if pricing_quality == "usable" and liquidity_quality in ("good", "fair"):
+        what_it_means.append("Pricing quality appears usable for this completed window.")
+    elif pricing_quality == "degraded":
+        what_it_means.append("Pricing quality is degraded — spreads may distort contract value reads.")
+    elif pricing_quality == "unknown":
+        what_it_means.append("Pricing quality is unknown — insufficient data for a reliable read.")
+
+    if cheap_side not in ("unknown", "balanced") and cheapest:
+        top_cheap = cheapest[0]
+        lag = top_cheap.get("pricing_lag")
+        if lag is not None:
+            what_it_means.append(f"Cheapest contract shows {float(lag):.1f}% pricing lag.")
+
+    # --- caveats ---
+    caveats = []
+    if liquidity_quality == "poor":
+        caveats.append("Liquidity quality is poor — wide spreads may affect pricing accuracy.")
+    caveats.append("This is not a trade recommendation.")
+
+    # --- headline ---
+    if trade_count == 0:
+        headline = "No trading activity in this window"
+    elif bias == "call_heavy":
+        headline = "Call-heavy premium with " + liquidity_quality + " liquidity"
+    elif bias == "put_heavy":
+        headline = "Put-heavy premium with " + liquidity_quality + " liquidity"
+    else:
+        headline = "Balanced premium with " + liquidity_quality + " liquidity"
+
+    # --- summary ---
+    if trade_count == 0:
+        summary = "No trades in this completed window."
+    elif bias == "call_heavy":
+        summary = f"Call premium dominated ({_fmt_premium(call_p)} vs {_fmt_premium(put_p)}), {cheap_side} side appears cheap."
+    elif bias == "put_heavy":
+        summary = f"Put premium dominated ({_fmt_premium(put_p)} vs {_fmt_premium(call_p)}), {cheap_side} side appears cheap."
+    else:
+        summary = f"Premium was balanced ({_fmt_premium(total_p)} total), {cheap_side} side appears cheap."
+
+    result = {
         "narrative_version": NARRATIVE_VERSION,
-        "summary": "Market context narrative not yet implemented.",
+        "summary": summary,
         "narrative": {
-            "headline": "Context available",
-            "what_happened": [],
-            "what_it_means": [],
-            "caveats": [],
+            "headline": headline,
+            "what_happened": what_happened,
+            "what_it_means": what_it_means,
+            "caveats": caveats,
             "reason_codes": [],
         },
     }
+
+    all_text = summary + " " + headline + " " + " ".join(what_happened) + " " + " ".join(what_it_means) + " " + " ".join(caveats)
+    violations = check_banned_phrases(all_text)
+    if violations:
+        raise ValueError(f"Narrative contains banned phrases: {violations}")
+
+    return result
 
 
 # ---------------------------------------------------------------------------

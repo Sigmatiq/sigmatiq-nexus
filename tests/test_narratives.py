@@ -227,6 +227,109 @@ class TestParticipantFlowNarrative:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Option market context narrative
+# ---------------------------------------------------------------------------
+
+
+def _omc_payload(**overrides):
+    base = {
+        "premium": {
+            "call_premium": 800_000,
+            "put_premium": 400_000,
+            "total_premium": 1_200_000,
+            "net_premium_bias": "call_heavy",
+        },
+        "activity": {
+            "trade_count": 150,
+            "contract_count": 25,
+            "sweep_count": 8,
+            "large_trade_count": 5,
+        },
+        "most_traded_contracts": [{"raw_symbol": "SPY260508C00560000", "premium": 200_000}],
+        "cheapest_contracts": [{"raw_symbol": "SPY260508C00558000", "pricing_lag": -6.1}],
+        "costliest_contracts": [{"raw_symbol": "SPY260508P00555000", "pricing_lag": 4.3}],
+        "cheap_side": "calls",
+        "costly_side": "puts",
+        "liquidity_quality": "good",
+        "pricing_quality": "usable",
+    }
+    base.update(overrides)
+    return base
+
+
+class TestOptionMarketContextNarrative:
+
+    def test_call_heavy_summary(self):
+        result = narratives.build_option_market_context_narrative(_omc_payload())
+        assert "Call premium dominated" in result["summary"]
+        assert result["narrative_version"] == "1.0"
+
+    def test_put_heavy_summary(self):
+        payload = _omc_payload(
+            premium={"call_premium": 200_000, "put_premium": 700_000, "total_premium": 900_000, "net_premium_bias": "put_heavy"},
+        )
+        result = narratives.build_option_market_context_narrative(payload)
+        assert "Put premium dominated" in result["summary"]
+
+    def test_balanced_summary(self):
+        payload = _omc_payload(
+            premium={"call_premium": 500_000, "put_premium": 500_000, "total_premium": 1_000_000, "net_premium_bias": "balanced"},
+        )
+        result = narratives.build_option_market_context_narrative(payload)
+        assert "balanced" in result["summary"].lower()
+
+    def test_no_trades_summary(self):
+        payload = _omc_payload(
+            premium={"call_premium": 0, "put_premium": 0, "total_premium": 0, "net_premium_bias": "balanced"},
+            activity={"trade_count": 0, "contract_count": 0, "sweep_count": 0, "large_trade_count": 0},
+        )
+        result = narratives.build_option_market_context_narrative(payload)
+        assert "no trades" in result["summary"].lower()
+
+    def test_poor_liquidity_caveat(self):
+        payload = _omc_payload(liquidity_quality="poor")
+        result = narratives.build_option_market_context_narrative(payload)
+        assert any("poor" in c.lower() for c in result["narrative"]["caveats"])
+
+    def test_not_trade_recommendation_caveat(self):
+        result = narratives.build_option_market_context_narrative(_omc_payload())
+        assert any("not a trade recommendation" in c.lower() for c in result["narrative"]["caveats"])
+
+    def test_degraded_pricing_in_what_it_means(self):
+        payload = _omc_payload(pricing_quality="degraded")
+        result = narratives.build_option_market_context_narrative(payload)
+        assert any("degraded" in m.lower() for m in result["narrative"]["what_it_means"])
+
+    def test_cheap_side_in_what_happened(self):
+        result = narratives.build_option_market_context_narrative(_omc_payload())
+        what = " ".join(result["narrative"]["what_happened"])
+        assert "cheap side" in what.lower()
+
+    def test_required_fields_present(self):
+        result = narratives.build_option_market_context_narrative(_omc_payload())
+        assert "narrative_version" in result
+        assert "summary" in result
+        assert "narrative" in result
+        assert "headline" in result["narrative"]
+        assert "what_happened" in result["narrative"]
+        assert "what_it_means" in result["narrative"]
+        assert "caveats" in result["narrative"]
+
+    def test_no_banned_phrases(self):
+        result = narratives.build_option_market_context_narrative(_omc_payload())
+        all_text = result["summary"] + " " + result["narrative"]["headline"]
+        all_text += " " + " ".join(result["narrative"]["what_happened"])
+        all_text += " " + " ".join(result["narrative"]["what_it_means"])
+        all_text += " " + " ".join(result["narrative"]["caveats"])
+        assert narratives.check_banned_phrases(all_text) == []
+
+
+# ---------------------------------------------------------------------------
+# Window view narrative
+# ---------------------------------------------------------------------------
+
+
 class TestWindowViewNarrative:
 
     def test_chop_summary(self):

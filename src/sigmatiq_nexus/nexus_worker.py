@@ -17,6 +17,7 @@ import polars as pl
 import redis.asyncio as redis
 from redis.asyncio.cluster import RedisCluster
 
+from sigmatiq_nexus import narratives
 from sigmatiq_nexus import participant_flow as pf
 
 # --- CONFIGURATION ---
@@ -1099,7 +1100,7 @@ class SigmatiqNexus:
             cheap_side = "balanced"
             costly_side = "balanced"
         late = self.late_window_impacts.get(window_eval_key(session_date, symbol, slot["entry_label"])) or {}
-        return {
+        payload = {
             "symbol": symbol,
             "window_id": slot["entry_label"],
             "window_start": slot["window_start"].isoformat(),
@@ -1133,6 +1134,8 @@ class SigmatiqNexus:
             },
             "source": "sigmatiq_nexus",
         }
+        payload.update(narratives.build_option_market_context_narrative(payload))
+        return payload
 
     async def connect(self):
         if REDIS_CLUSTER:
@@ -1444,6 +1447,7 @@ class SigmatiqNexus:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "source": "sigmatiq_nexus",
         }
+        msg.update(narratives.build_lifecycle_reason_summary(msg))
         if symbol in self.active_positions:
             del self.active_positions[symbol]
         position_session_date = active_position.get("session_date") or ny_session_date(datetime.now(timezone.utc))
@@ -1783,6 +1787,7 @@ class SigmatiqNexus:
             "window_end": slot["window_end"].isoformat(),
             "source": "sigmatiq_nexus",
         }
+        msg.update(narratives.build_lifecycle_reason_summary(msg))
         self._log(
             "strategy_blocked",
             strategy=strategy,
@@ -1827,6 +1832,7 @@ class SigmatiqNexus:
         msg["lead_contract_side"] = lead_contract["side"]
         msg["lead_contract_pricing_lag"] = lead_pricing["pricing_lag"] if lead_pricing else None
         msg["lead_contract_cheapness_score"] = lead_pricing["cheapness_score"] if lead_pricing else None
+        msg.update(narratives.build_window_view_narrative(msg))
         redis_key = f"nexus_window_view:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
@@ -2323,6 +2329,7 @@ class SigmatiqNexus:
             msg.update({"entry_time": slot["entry_label"], "window_start": slot["window_start"].isoformat(), "window_end": slot["window_end"].isoformat()})
         if session_date:
             msg["session_date"] = str(session_date)
+        msg.update(narratives.build_lifecycle_reason_summary(msg))
         entry_label = slot["entry_label"] if slot else "na"
         redis_key = f"nexus_intermediate:{symbol}:{strategy}:{entry_label}"
         await self.redis.set(redis_key, json.dumps(msg))
@@ -2408,6 +2415,7 @@ class SigmatiqNexus:
                 "strike": _contract_details_from_raw_symbol(raw_symbol)["strike"],
                 "option_side": _contract_details_from_raw_symbol(raw_symbol)["side"],
             }.items() if v is not None})
+        msg.update(narratives.build_lifecycle_reason_summary(msg))
         # Track position for dynamic exit
         active_positions = getattr(self, "active_positions", None)
         if active_positions is None:
