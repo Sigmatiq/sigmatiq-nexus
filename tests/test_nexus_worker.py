@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import msgpack
 import polars as pl
@@ -1675,3 +1675,102 @@ def test_momentum_specialist_requires_underlying_mid_and_uses_iv_gate():
 
     assert (sentiment, valid) == ("BULLISH", True)
     assert p_feat[:2] == [10.0, 0.0]
+
+
+# ---------------------------------------------------------------------------
+# Participant Flow Context — integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_publish_participant_flow_context_sets_keys_and_publishes():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    worker.participant_flow_reported = set()
+    worker.buffers = {"SPY": deque(maxlen=100)}
+    worker.buffers["SPY"].extend([
+        {
+            "ts_utc": "2026-05-08T13:35:00Z",
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260508C00560000",
+            "side": "C",
+            "premium": 300_000.0,
+            "is_sweep": True,
+            "aggressor": "A",
+            "delta": 0.5,
+            "option_mid": 10.0,
+            "option_bid": 9.9,
+            "option_ask": 10.1,
+            "underlying_mid": 560.0,
+        },
+        {
+            "ts_utc": "2026-05-08T13:50:00Z",
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260508P00555000",
+            "side": "P",
+            "premium": 50_000.0,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": -0.4,
+            "option_mid": 7.0,
+            "option_bid": 6.9,
+            "option_ask": 7.1,
+            "underlying_mid": 560.0,
+        },
+    ])
+
+    slot = nw.MARKET_CONTEXT_WINDOWS[0]  # w0930_1000
+    asyncio.run(worker.publish_participant_flow_context_for_slot("SPY", slot, date(2026, 5, 8)))
+
+    redis_key = f"nexus_participant_flow_context:SPY:{slot['entry_label']}"
+    latest_key = "nexus_participant_flow_context:SPY:latest"
+
+    # Verify both keys were set
+    assert redis_key in worker.redis.values
+    assert latest_key in worker.redis.values
+
+    # Verify payload structure
+    msg = json.loads(worker.redis.values[redis_key])
+    assert msg["schema_version"] == 1
+    assert msg["symbol"] == "SPY"
+    assert msg["window_key"] == slot["entry_label"]
+    assert msg["source"] == "sigmatiq_nexus"
+    assert msg["window_side_read"]["premium_bias"] in ("call_heavy", "put_heavy", "balanced")
+    assert msg["dealer_inferred_pressure"]["underlying_hedge_direction"] == "unknown"
+    assert msg["data_quality"]["status"] in ("usable", "degraded", "thin", "stale", "unknown")
+    assert "opening_or_closing_unknown" in msg["data_quality"]["degraded"]
+
+    # Verify persistence stream
+    assert len(worker.redis.xadds) == 1
+    assert worker.redis.xadds[0][1]["redis_key"] == redis_key
+
+    # Verify pub/sub
+    assert len(worker.redis.publishes) == 1
+    assert worker.redis.publishes[0][0] == "signal:participant_flow_context"
+
+
+def test_publish_participant_flow_context_dedup_guard():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    worker.participant_flow_reported = set()
+    worker.buffers = {"SPY": deque(maxlen=100)}
+    worker.buffers["SPY"].append({
+        "ts_utc": "2026-05-08T13:35:00Z",
+        "symbol": "SPY",
+        "raw_symbol": "SPY   260508C00560000",
+        "side": "C",
+        "premium": 100_000.0,
+        "is_sweep": False,
+        "aggressor": "A",
+        "delta": 0.5,
+        "option_mid": 10.0,
+        "option_bid": 9.9,
+        "option_ask": 10.1,
+    })
+
+    slot = nw.MARKET_CONTEXT_WINDOWS[0]
+    asyncio.run(worker.publish_participant_flow_context_for_slot("SPY", slot, date(2026, 5, 8)))
+    first_set_count = len(worker.redis.sets)
+
+    asyncio.run(worker.publish_participant_flow_context_for_slot("SPY", slot, date(2026, 5, 8)))
+    # Second call should be a no-op
+    assert len(worker.redis.sets) == first_set_count

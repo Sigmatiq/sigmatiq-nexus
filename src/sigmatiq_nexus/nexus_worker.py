@@ -17,6 +17,8 @@ import polars as pl
 import redis.asyncio as redis
 from redis.asyncio.cluster import RedisCluster
 
+from sigmatiq_nexus import participant_flow as pf
+
 # --- CONFIGURATION ---
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 REDIS_CLUSTER = os.environ.get("NEXUS_REDIS_CLUSTER", "false").strip().lower() == "true"
@@ -898,6 +900,7 @@ class SigmatiqNexus:
         self.window_views_reported = set()
         self.window_pricing_reported = set()
         self.option_market_context_reported = set()
+        self.participant_flow_reported = set()
         self.evaluated_windows = set()
         self.late_window_impacts = {}
         self.redis = None
@@ -1200,6 +1203,7 @@ class SigmatiqNexus:
             self.window_views_reported.clear()
             self.window_pricing_reported.clear()
             self.option_market_context_reported.clear()
+            self.participant_flow_reported.clear()
             self.evaluated_windows.clear()
             self.late_window_impacts.clear()
             self.last_reset_session_date = current_session_date
@@ -1397,6 +1401,7 @@ class SigmatiqNexus:
                 if not self._slot_due(reference_dt_utc, slot):
                     continue
                 await self.publish_option_market_context_for_slot(symbol, slot, session_date)
+                await self.publish_participant_flow_context_for_slot(symbol, slot, session_date)
             for slot in DECISION_SLOTS:
                 if not self._slot_due(reference_dt_utc, slot):
                     continue
@@ -1899,6 +1904,34 @@ class SigmatiqNexus:
             trade_count=msg["activity"]["trade_count"],
             contract_count=msg["activity"]["contract_count"],
             pricing_quality=msg["pricing_quality"],
+        )
+
+    async def publish_participant_flow_context_for_slot(self, symbol: str, slot: dict, session_date) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "participant_flow_reported", set())
+        if key in reported:
+            return
+        if symbol not in self.buffers:
+            return
+        df = window_df_for_slot(pl.DataFrame(list(self.buffers[symbol])), slot)
+        if df.is_empty():
+            return
+        msg = pf.build_participant_flow_payload(df, symbol, slot, session_date, pf.PARTICIPANT_FLOW_DEFAULT_CONFIG)
+        redis_key = f"nexus_participant_flow_context:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
+        await self.redis.set(f"nexus_participant_flow_context:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self.redis.publish("signal:participant_flow_context", json.dumps(msg))
+        # Mark reported only after all writes succeed
+        reported.add(key)
+        self.participant_flow_reported = reported
+        self._log(
+            "participant_flow_context_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_key=slot["entry_label"],
+            directional_read=msg.get("window_side_read", {}).get("directional_read"),
+            data_quality=msg.get("data_quality", {}).get("status"),
         )
 
     async def publish_window_assessments(self, df: pl.DataFrame, symbol: str, slot: dict, session_date) -> None:

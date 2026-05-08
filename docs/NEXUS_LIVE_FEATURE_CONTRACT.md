@@ -421,6 +421,15 @@ Payload includes premium totals, call/put premium bias, trade/contract counts, m
   - Redis key: `nexus_option_market_context:{symbol}:{window_id}` and `nexus_option_market_context:{symbol}:latest`
   - Pub/Sub: `signal:option_market_context`
   - Full-session non-strategy market context for pricing and contract-activity consumers
+- `PARTICIPANT_FLOW_CONTEXT`
+  - Redis key: `nexus_participant_flow_context:{symbol}:{window_key}` and `nexus_participant_flow_context:{symbol}:latest`
+  - Pub/Sub: `signal:participant_flow_context`
+  - Full-session participant flow context for completed 30-minute windows
+  - Includes `window_side_read`, `retail_like_flow`, `institutional_like_flow`, `dealer_inferred_pressure`, `dominant_strategy_shape`, `top_contracts`, and `data_quality`
+  - v1 publishes `dealer_inferred_pressure` as `unknown` until dealer context reads are wired
+  - v1 does not attempt spread/structure heuristic detection
+  - TTL: 48 hours for window keys, 8 hours for latest key
+  - See `docs/NEXUS_PARTICIPANT_FLOW_CONTEXT_DESIGN.md` for full schema and labeling taxonomy
 - `LIQUIDATE`
   - Redis key: `nexus_live_overlay:{symbol}`
   - Pub/Sub: `nexus_live_overlay:updates`
