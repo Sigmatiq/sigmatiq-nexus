@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from sigmatiq_nexus import narratives
+
 NY = ZoneInfo("America/New_York")
 
 # ---------------------------------------------------------------------------
@@ -553,7 +555,7 @@ def build_participant_flow_payload(
     window_end_et = datetime.combine(session_date, we, tzinfo=NY).isoformat()
     window_label = f"{ws.strftime('%H:%M')}-{we.strftime('%H:%M')}"
 
-    return {
+    payload = {
         "schema_version": 1,
         "symbol": symbol,
         "window_key": window_key,
@@ -576,6 +578,12 @@ def build_participant_flow_payload(
         "data_quality": aggregated["data_quality"],
         "source": "sigmatiq_nexus",
     }
+
+    # Add deterministic narrative fields
+    narrative_fields = narratives.build_participant_flow_context_narrative(payload)
+    payload.update(narrative_fields)
+
+    return payload
 
 
 # ---------------------------------------------------------------------------
