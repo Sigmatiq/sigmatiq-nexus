@@ -447,6 +447,24 @@ def redis_active_position_key(session_date, symbol: str) -> str:
     return f"nexus:active_position:{session_date}:{symbol}"
 
 
+def nexus_index_key(session_date, symbol: str, kind: str) -> str:
+    """Per-(session_date, symbol) index set used by sigmatiq-api to enumerate
+    Nexus messages without scanning Redis. ``kind`` is one of ``window_view``,
+    ``intermediate``, ``spread``, ``pricing``, ``late_event``, ``omc``,
+    ``participant_flow``."""
+    return f"nexus:index:{session_date}:{symbol}:{kind}"
+
+
+def nexus_positions_index_key(session_date) -> str:
+    """Cross-symbol set of symbols with currently-open paper positions."""
+    return f"nexus:index:{session_date}:positions"
+
+
+# 48 hours covers the longest live-data TTL (completed-window OMC and
+# participant flow). Index entries are tiny so a uniform TTL is fine.
+NEXUS_INDEX_TTL_SECONDS = 48 * 3600
+
+
 def redis_stream_offset_key(stream_name: str) -> str:
     return STREAM_OFFSET_KEY_TEMPLATE.format(stream=stream_name)
 
@@ -1598,6 +1616,10 @@ class SigmatiqNexus:
         msg.update(narratives.build_window_late_event_narrative(msg))
         redis_key = f"nexus_window_late_event:{symbol}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "late_event"),
+            slot["entry_label"],
+        )
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish("signal:window_late_event", json.dumps(msg))
         self._log(
@@ -1681,6 +1703,10 @@ class SigmatiqNexus:
             del self.active_positions[symbol]
         position_session_date = active_position.get("session_date") or ny_session_date(datetime.now(timezone.utc))
         await self._clear_active_position(position_session_date, symbol)
+        await self._index_srem(
+            nexus_positions_index_key(position_session_date),
+            symbol,
+        )
         await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
         await self._append_persistence_event(symbol, msg)
         await self._publish("nexus_live_overlay:updates", symbol)
@@ -2135,6 +2161,10 @@ class SigmatiqNexus:
         )
         redis_key = f"nexus_window_view:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "window_view"),
+            f"{strategy}:{slot['entry_label']}",
+        )
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish(f"signal:window_view:{strategy}", json.dumps(msg))
 
@@ -2172,6 +2202,10 @@ class SigmatiqNexus:
         msg.update(narratives.build_window_view_narrative(msg))
         redis_key = f"nexus_window_view:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "window_view"),
+            f"{strategy}:{slot['entry_label']}",
+        )
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish(f"signal:window_view:{strategy}", json.dumps(msg))
         self._log("strategy_window_view_published", strategy=strategy, symbol=symbol, sentiment=sentiment, reason=reason, session_date=str(session_date), entry_time=slot["entry_label"])
@@ -2220,6 +2254,10 @@ class SigmatiqNexus:
         msg.update(narratives.build_window_pricing_narrative(msg))
         redis_key = f"nexus_window_pricing:{symbol}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "pricing"),
+            slot["entry_label"],
+        )
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish("signal:window_pricing", json.dumps(msg))
         self._log("window_pricing_published", symbol=symbol, session_date=str(session_date), entry_time=slot["entry_label"], evaluated_contract_count=summary["evaluated_contract_count"])
@@ -2236,6 +2274,10 @@ class SigmatiqNexus:
         redis_key = f"nexus_option_market_context:{symbol}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
         await self.redis.set(f"nexus_option_market_context:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "omc"),
+            slot["entry_label"],
+        )
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish("signal:option_market_context", json.dumps(msg))
         # Mark reported only after all writes succeed so transient Redis errors can retry.
@@ -2263,6 +2305,10 @@ class SigmatiqNexus:
         redis_key = f"nexus_participant_flow_context:{symbol}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
         await self.redis.set(f"nexus_participant_flow_context:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "participant_flow"),
+            slot["entry_label"],
+        )
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish("signal:participant_flow_context", json.dumps(msg))
         # Mark reported only after all writes succeed
@@ -2682,6 +2728,11 @@ class SigmatiqNexus:
         entry_label = slot["entry_label"] if slot else "na"
         redis_key = f"nexus_intermediate:{symbol}:{strategy}:{entry_label}"
         await self.redis.set(redis_key, json.dumps(msg))
+        if session_date:
+            await self._index_sadd(
+                nexus_index_key(session_date, symbol, "intermediate"),
+                f"{strategy}:{entry_label}",
+            )
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish("nexus_intermediate:updates", symbol)
         await self._publish(f"signal:intermediate:{strategy}", json.dumps(msg))
@@ -2782,6 +2833,10 @@ class SigmatiqNexus:
             }
             active_positions[symbol] = position
             await self._persist_active_position(key_date, symbol, position)
+            await self._index_sadd(
+                nexus_positions_index_key(key_date),
+                symbol,
+            )
 
         await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
         await self._append_persistence_event(symbol, msg)
@@ -2884,6 +2939,10 @@ class SigmatiqNexus:
         msg.update(narratives.build_lifecycle_reason_summary(msg))
         redis_key = f"nexus_spread_overlay:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "spread"),
+            f"{strategy}:{slot['entry_label']}",
+        )
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish("nexus_spread_overlay:updates", symbol)
         await self._publish(f"signal:spread:{strategy}", json.dumps(msg))
@@ -2911,6 +2970,23 @@ class SigmatiqNexus:
             )
         except Exception as exc:
             self._log("persistence_event_append_failed", redis_key=redis_key, error=str(exc))
+
+    async def _index_sadd(self, key: str, member: str, ttl_seconds: int = NEXUS_INDEX_TTL_SECONDS) -> None:
+        """Add a member to a per-session index set so sigmatiq-api can enumerate
+        Nexus messages without scanning Redis. Logs and swallows transient
+        failures to avoid blocking the publish path."""
+        try:
+            await self.redis.sadd(key, member)
+            await self.redis.expire(key, ttl_seconds)
+        except Exception as exc:
+            self._log("nexus_index_add_failed", key=key, member=member, error=str(exc))
+
+    async def _index_srem(self, key: str, member: str) -> None:
+        """Remove a member from an index set (used when a paper position is liquidated)."""
+        try:
+            await self.redis.srem(key, member)
+        except Exception as exc:
+            self._log("nexus_index_remove_failed", key=key, member=member, error=str(exc))
 
 
 def main() -> None:

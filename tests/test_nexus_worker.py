@@ -359,6 +359,7 @@ class FakeRedis:
         self.publishes = []
         self.xadds = []
         self.xrevranges = {}
+        self.index_sets = {}
 
     async def get(self, key):
         return self.values.get(key)
@@ -374,6 +375,7 @@ class FakeRedis:
 
     async def delete(self, key):
         self.values.pop(key, None)
+        self.index_sets.pop(key, None)
         return 1
 
     async def publish(self, channel, value):
@@ -385,6 +387,37 @@ class FakeRedis:
 
     async def xrevrange(self, name, count=None):
         return self.xrevranges.get(name, [])[:count]
+
+    async def sadd(self, key, *members):
+        bucket = self.index_sets.setdefault(key, set())
+        added = 0
+        for member in members:
+            if member not in bucket:
+                bucket.add(member)
+                added += 1
+        return added
+
+    async def srem(self, key, *members):
+        bucket = self.index_sets.get(key)
+        if not bucket:
+            return 0
+        removed = 0
+        for member in members:
+            if member in bucket:
+                bucket.discard(member)
+                removed += 1
+        if not bucket:
+            self.index_sets.pop(key, None)
+        return removed
+
+    async def smembers(self, key):
+        return set(self.index_sets.get(key, set()))
+
+    async def expire(self, key, ttl_seconds):
+        if key in self.values or key in self.index_sets:
+            self.expires[key] = ttl_seconds
+            return 1
+        return 0
 
 
 class FakeXReadRedis:
@@ -671,7 +704,8 @@ def test_publish_intermediate_sets_key_and_appends_persistence_event():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.redis = FakeRedis()
 
-    asyncio.run(worker._publish_intermediate("etf_low_sweep_core", "SPY", "BULLISH", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date(), "SPY   260505C00720000"))
+    session_date = datetime(2026, 5, 5).date()
+    asyncio.run(worker._publish_intermediate("etf_low_sweep_core", "SPY", "BULLISH", nw.DECISION_SLOTS[0], session_date, "SPY   260505C00720000"))
 
     assert worker.redis.sets[0][0] == "nexus_intermediate:SPY:etf_low_sweep_core:10:00"
     payload = json.loads(worker.redis.sets[0][1])
@@ -685,6 +719,42 @@ def test_publish_intermediate_sets_key_and_appends_persistence_event():
     assert worker.redis.xadds[0][1]["redis_key"] == "nexus_intermediate:SPY:etf_low_sweep_core:10:00"
     assert worker.redis.publishes[0] == ("nexus_intermediate:updates", "SPY")
     assert worker.redis.publishes[1][0] == "signal:intermediate:etf_low_sweep_core"
+
+    index_key = nw.nexus_index_key(session_date, "SPY", "intermediate")
+    assert asyncio.run(worker.redis.smembers(index_key)) == {"etf_low_sweep_core:10:00"}
+    assert worker.redis.expires[index_key] == nw.NEXUS_INDEX_TTL_SECONDS
+
+
+def test_index_sadd_swallows_redis_failures_and_logs():
+    class FailingRedis:
+        async def sadd(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+        async def expire(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FailingRedis()
+    logged: list[tuple[str, dict]] = []
+    worker._log = lambda event, **kwargs: logged.append((event, kwargs))
+
+    # Must not raise — publish path should not be blocked by index errors.
+    asyncio.run(worker._index_sadd("nexus:index:test", "member"))
+    assert logged and logged[0][0] == "nexus_index_add_failed"
+
+
+def test_index_helpers_round_trip_via_fake_redis():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    key = "nexus:index:2026-05-05:SPY:window_view"
+
+    asyncio.run(worker._index_sadd(key, "etf_flow_specialist:10:30"))
+    asyncio.run(worker._index_sadd(key, "etf_momentum_specialist:11:00"))
+    members = asyncio.run(worker.redis.smembers(key))
+    assert members == {"etf_flow_specialist:10:30", "etf_momentum_specialist:11:00"}
+
+    asyncio.run(worker._index_srem(key, "etf_flow_specialist:10:30"))
+    assert asyncio.run(worker.redis.smembers(key)) == {"etf_momentum_specialist:11:00"}
 
 
 def test_publish_window_view_sets_key_and_appends_persistence_event():
