@@ -1761,26 +1761,26 @@ class SigmatiqNexus:
             **self._window_log_fields(slot_df, slot),
         )
         await self.publish_window_pricing(slot_df, symbol, slot, session_date)
-        await self.publish_window_assessments(slot_df, symbol, slot, session_date)
+        await self.publish_window_assessments(slot_df, symbol, slot, session_date, event_dt_utc)
         if trade_locked:
             self._log("trade_evaluation_skipped", symbol=symbol, session_date=str(session_date), reason="already_signaled", entry_time=slot["entry_label"])
             return
 
         # Deterministic order follows the research log: confluence first, then
         # the specialist assigned to the completed window. First trigger wins.
-        await self.evaluate_confluence_sniper(slot_df, symbol, slot, session_date)
+        await self.evaluate_confluence_sniper(slot_df, symbol, slot, session_date, event_dt_utc)
         if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "10:00":
-            await self.evaluate_put_credit_open30_spread(slot_df, symbol, slot, session_date)
+            await self.evaluate_put_credit_open30_spread(slot_df, symbol, slot, session_date, event_dt_utc)
         if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "10:00":
-            await self.evaluate_call_credit_open30_spread(slot_df, symbol, slot, session_date)
+            await self.evaluate_call_credit_open30_spread(slot_df, symbol, slot, session_date, event_dt_utc)
         if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "10:00":
-            await self.evaluate_open_specialist(slot_df, symbol, slot, session_date)
+            await self.evaluate_open_specialist(slot_df, symbol, slot, session_date, event_dt_utc)
         if not self.already_signaled(session_date, symbol, "*"):
-            await self.evaluate_low_sweep_core(slot_df, symbol, slot, session_date)
+            await self.evaluate_low_sweep_core(slot_df, symbol, slot, session_date, event_dt_utc)
         if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "10:30":
-            await self.evaluate_flow_specialist(slot_df, symbol, slot, session_date)
+            await self.evaluate_flow_specialist(slot_df, symbol, slot, session_date, event_dt_utc)
         if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "11:00":
-            await self.evaluate_momentum_specialist(slot_df, symbol, slot, session_date)
+            await self.evaluate_momentum_specialist(slot_df, symbol, slot, session_date, event_dt_utc)
 
     async def _window_df_for_symbol(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> pl.DataFrame:
         buffer_df = window_df_for_slot(pl.DataFrame(list(self.buffers.get(symbol, []))), slot, session_date)
@@ -1974,8 +1974,8 @@ class SigmatiqNexus:
         status = _freshness_status(reference_time, feature_time, max_age, missing_is_stale=NEXUS_REQUIRE_CONTEXT_TIMESTAMPS)
         return "fallback" if status == "available" else status
 
-    async def _strategy_features_ready(self, strategy: str, symbol: str, df: pl.DataFrame, slot: dict, session_date) -> bool:
-        failures = await self._strategy_feature_failures(strategy, symbol, df)
+    async def _strategy_features_ready(self, strategy: str, symbol: str, df: pl.DataFrame, slot: dict, session_date, reference_time: datetime | None = None) -> bool:
+        failures = await self._strategy_feature_failures(strategy, symbol, df, reference_time)
         if not failures:
             return True
         await self._publish_feature_block(strategy, symbol, slot, session_date, failures)
@@ -1984,7 +1984,7 @@ class SigmatiqNexus:
     async def _missing_strategy_features(self, strategy: str, symbol: str, df: pl.DataFrame) -> list[str]:
         return sorted((await self._strategy_feature_failures(strategy, symbol, df)).keys())
 
-    async def _strategy_feature_failures(self, strategy: str, symbol: str, df: pl.DataFrame) -> dict[str, str]:
+    async def _strategy_feature_failures(self, strategy: str, symbol: str, df: pl.DataFrame, reference_time: datetime | None = None) -> dict[str, str]:
         required = STRATEGY_REQUIRED_FEATURES[strategy]
         failures = {}
         for feature in required:
@@ -1994,7 +1994,7 @@ class SigmatiqNexus:
                     failures[feature] = status
         context_required = [feature for feature in required if feature in CONTEXT_FEATURES]
         if context_required:
-            _, _, _, context_status = await self.get_context_with_quality(symbol, self._window_reference_time(df))
+            _, _, _, context_status = await self.get_context_with_quality(symbol, reference_time or self._window_reference_time(df))
             for feature in context_required:
                 status = context_status.get(feature, "missing")
                 if status not in FRESH_STATUSES:
@@ -2200,7 +2200,7 @@ class SigmatiqNexus:
             data_quality=msg.get("data_quality", {}).get("status"),
         )
 
-    async def publish_window_assessments(self, df: pl.DataFrame, symbol: str, slot: dict, session_date) -> None:
+    async def publish_window_assessments(self, df: pl.DataFrame, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> None:
         self._current_window_df = df
         strategies = [
             ("etf_confluence_sniper", self.assess_confluence_window),
@@ -2212,7 +2212,7 @@ class SigmatiqNexus:
             ("etf_call_credit_open30_spread", self.assess_call_credit_open30_spread),
         ]
         for strategy, assessor in strategies:
-            failures = await self._strategy_feature_failures(strategy, symbol, df)
+            failures = await self._strategy_feature_failures(strategy, symbol, df, reference_time)
             if failures:
                 await self._publish_feature_block(strategy, symbol, slot, session_date, failures)
                 continue
@@ -2234,11 +2234,11 @@ class SigmatiqNexus:
         price = float(side_df.filter(pl.col("raw_symbol") == raw_symbol).tail(1).select(pl.col(price_col)).item() or 0.0)
         return raw_symbol, price
 
-    async def evaluate_confluence_sniper(self, df, symbol, slot: dict, session_date):
+    async def evaluate_confluence_sniper(self, df, symbol, slot: dict, session_date, reference_time: datetime | None = None):
         strategy = "etf_confluence_sniper"
         if self.already_signaled(session_date, symbol, strategy):
             return
-        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
+        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date, reference_time):
             return
         sentiment, valid, p_feat = await self.check_momentum_heuristics(df, symbol)
         if not valid:
@@ -2261,11 +2261,11 @@ class SigmatiqNexus:
             return "CHOP", "pricing_lag_not_cheap_enough"
         return sentiment, "confluence_alignment"
 
-    async def evaluate_put_credit_open30_spread(self, df, symbol, slot: dict, session_date):
+    async def evaluate_put_credit_open30_spread(self, df, symbol, slot: dict, session_date, reference_time: datetime | None = None):
         strategy = "etf_put_credit_open30_spread"
         if self.already_signaled(session_date, symbol, strategy) or slot["entry_label"] != "10:00" or symbol not in {"SPY", "QQQ"}:
             return
-        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
+        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date, reference_time):
             return
         sentiment, valid = await self.check_put_credit_open30_spread(df, symbol, slot)
         if not valid:
@@ -2295,11 +2295,11 @@ class SigmatiqNexus:
         sentiment, valid = await self.check_put_credit_open30_spread(df, symbol, slot)
         return (sentiment, "open30_call_dominance_put_credit_context") if valid else ("CHOP", "put_credit_open30_filter_not_met")
 
-    async def evaluate_call_credit_open30_spread(self, df, symbol, slot: dict, session_date):
+    async def evaluate_call_credit_open30_spread(self, df, symbol, slot: dict, session_date, reference_time: datetime | None = None):
         strategy = "etf_call_credit_open30_spread"
         if self.already_signaled(session_date, symbol, strategy) or slot["entry_label"] != "10:00" or symbol != "SPY":
             return
-        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
+        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date, reference_time):
             return
         sentiment, valid = await self.check_call_credit_open30_spread(df, symbol, slot)
         if not valid:
@@ -2372,11 +2372,11 @@ class SigmatiqNexus:
         expected_change = delta * (s_now - s_start)
         return (actual_change - expected_change) / (p_start + 1e-9)
 
-    async def evaluate_open_specialist(self, df, symbol, slot: dict, session_date):
+    async def evaluate_open_specialist(self, df, symbol, slot: dict, session_date, reference_time: datetime | None = None):
         strategy = "etf_open_specialist"
         if self.already_signaled(session_date, symbol, strategy) or slot["entry_label"] != "10:00":
             return
-        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
+        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date, reference_time):
             return
         sentiment, valid = await self.check_open_specialist_heuristic(df, symbol, slot)
         if valid:
@@ -2411,11 +2411,11 @@ class SigmatiqNexus:
             return "BEARISH", "put_dominance"
         return "CHOP", "no_open_dominance"
 
-    async def evaluate_low_sweep_core(self, df, symbol, slot: dict, session_date):
+    async def evaluate_low_sweep_core(self, df, symbol, slot: dict, session_date, reference_time: datetime | None = None):
         strategy = "etf_low_sweep_core"
         if self.already_signaled(session_date, symbol, strategy):
             return
-        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
+        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date, reference_time):
             return
         sentiment, valid = await self.calculate_low_sweep_heuristic(df, slot)
         if valid:
@@ -2451,11 +2451,11 @@ class SigmatiqNexus:
             return "BEARISH", "low_sweep_put_dominance"
         return "CHOP", "no_dominant_side"
 
-    async def evaluate_flow_specialist(self, df, symbol, slot: dict, session_date):
+    async def evaluate_flow_specialist(self, df, symbol, slot: dict, session_date, reference_time: datetime | None = None):
         strategy = "etf_flow_specialist"
         if self.already_signaled(session_date, symbol, strategy):
             return
-        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
+        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date, reference_time):
             return
         sentiment, valid = await self.check_flow_heuristics(df, symbol, slot)
         if valid:
@@ -2488,11 +2488,11 @@ class SigmatiqNexus:
                 return "BULLISH", True
         return None, False
 
-    async def evaluate_momentum_specialist(self, df, symbol, slot: dict, session_date):
+    async def evaluate_momentum_specialist(self, df, symbol, slot: dict, session_date, reference_time: datetime | None = None):
         strategy = "etf_momentum_specialist"
         if self.already_signaled(session_date, symbol, strategy):
             return
-        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
+        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date, reference_time):
             return
         sentiment, valid, p_feat = await self.check_momentum_heuristics(df, symbol)
         if valid:

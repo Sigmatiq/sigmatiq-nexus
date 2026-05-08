@@ -1751,14 +1751,14 @@ def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
     }
     calls = []
 
-    async def confluence(df, symbol, slot, session_date):
+    async def confluence(df, symbol, slot, session_date, *args):
         calls.append("confluence")
 
-    async def open_specialist(df, symbol, slot, session_date):
+    async def open_specialist(df, symbol, slot, session_date, *args):
         calls.append("open")
         await worker._publish_final("etf_open_specialist", symbol, "BULLISH", 0.95, 0.0, session_date, slot, "QQQ   260505C00500000")
 
-    async def hybrid(df, symbol, slot, session_date):
+    async def hybrid(df, symbol, slot, session_date, *args):
         calls.append("hybrid")
 
     worker.evaluate_confluence_sniper = confluence
