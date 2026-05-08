@@ -330,6 +330,74 @@ class TestOptionMarketContextNarrative:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Window pricing narrative
+# ---------------------------------------------------------------------------
+
+
+class TestWindowPricingNarrative:
+
+    def test_cheap_contract_summary(self):
+        payload = {
+            "cheap_contract_raw_symbol": "SPY260508C00560000",
+            "cheap_contract_side": "C",
+            "cheap_contract_pricing_lag": -8.2,
+            "costly_contract_raw_symbol": "SPY260508P00555000",
+            "costly_contract_pricing_lag": 4.3,
+            "cheap_side": "C",
+            "evaluated_contract_count": 25,
+        }
+        result = narratives.build_window_pricing_narrative(payload)
+        assert result["narrative_version"] == "1.0"
+        assert "SPY260508C00560000" in result["summary"]
+        assert "-8.2%" in result["summary"]
+        assert "calls" in result["summary"]
+
+    def test_no_contracts_summary(self):
+        payload = {"evaluated_contract_count": 0}
+        result = narratives.build_window_pricing_narrative(payload)
+        assert "no contracts" in result["summary"].lower()
+
+    def test_reason_summary_includes_costly(self):
+        payload = {
+            "cheap_contract_raw_symbol": "SPY260508C00560000",
+            "cheap_contract_pricing_lag": -6.0,
+            "costly_contract_raw_symbol": "SPY260508P00555000",
+            "costly_contract_pricing_lag": 3.5,
+            "cheap_side": "C",
+            "evaluated_contract_count": 15,
+        }
+        result = narratives.build_window_pricing_narrative(payload)
+        assert "3.5%" in result["reason_summary"]
+
+
+# ---------------------------------------------------------------------------
+# Window late event narrative
+# ---------------------------------------------------------------------------
+
+
+class TestWindowLateEventNarrative:
+
+    def test_late_event_reason_summary(self):
+        payload = {
+            "decision": "WINDOW_LATE_EVENT",
+            "raw_symbol": "SPY260508C00560000",
+            "side": "C",
+            "premium": 50_000,
+            "late_event_count": 3,
+        }
+        result = narratives.build_window_late_event_narrative(payload)
+        assert result["narrative_version"] == "1.0"
+        assert "call" in result["reason_summary"].lower()
+        assert "event 3" in result["reason_summary"]
+        assert "$50K" in result["reason_summary"]
+
+
+# ---------------------------------------------------------------------------
+# Window view narrative
+# ---------------------------------------------------------------------------
+
+
 class TestWindowViewNarrative:
 
     def test_chop_summary(self):

@@ -326,6 +326,55 @@ def build_option_market_context_narrative(payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def build_window_pricing_narrative(payload: dict) -> dict:
+    """Build narrative fields for a WINDOW_PRICING message."""
+    cheap_rs = payload.get("cheap_contract_raw_symbol")
+    cheap_side = payload.get("cheap_contract_side")
+    cheap_lag = payload.get("cheap_contract_pricing_lag")
+    costly_rs = payload.get("costly_contract_raw_symbol")
+    costly_lag = payload.get("costly_contract_pricing_lag")
+    count = int(payload.get("evaluated_contract_count") or 0)
+    side_label = {"C": "calls", "P": "puts"}.get(payload.get("cheap_side") or "", "unknown")
+
+    if count == 0:
+        summary = "No contracts evaluated for pricing in this window."
+        reason_summary = "No option trades with sufficient history for pricing lag calculation."
+    elif cheap_rs and cheap_lag is not None:
+        summary = f"Cheapest contract is {cheap_rs} ({float(cheap_lag):.1f}% lag), {side_label} side appears cheap across {count} contracts."
+        parts = [f"Cheapest contract shows {float(cheap_lag):.1f}% pricing lag"]
+        if costly_rs and costly_lag is not None:
+            parts.append(f"costliest shows +{float(costly_lag):.1f}%")
+        reason_summary = ", ".join(parts) + "."
+    else:
+        summary = f"{count} contracts evaluated, no clear cheap side."
+        reason_summary = "Pricing lag was computed but no standout cheap contract identified."
+
+    return {
+        "narrative_version": NARRATIVE_VERSION,
+        "summary": summary,
+        "reason_summary": reason_summary,
+    }
+
+
+def build_window_late_event_narrative(payload: dict) -> dict:
+    """Build narrative fields for a WINDOW_LATE_EVENT message."""
+    count = int(payload.get("late_event_count") or 0)
+    premium = float(payload.get("premium") or 0)
+    rs = payload.get("raw_symbol") or "unknown"
+    side = payload.get("side") or "unknown"
+    side_word = {"C": "call", "P": "put"}.get(side, "option")
+
+    reason_summary = (
+        f"Late {side_word} trade detected ({rs}, {_fmt_premium(premium)}). "
+        f"This is event {count} after the window was already evaluated."
+    )
+
+    return {
+        "narrative_version": NARRATIVE_VERSION,
+        "reason_summary": reason_summary,
+    }
+
+
 def build_window_view_narrative(payload: dict) -> dict:
     """Build narrative fields for a WINDOW_VIEW message."""
     sentiment = payload.get("sentiment", "unknown")

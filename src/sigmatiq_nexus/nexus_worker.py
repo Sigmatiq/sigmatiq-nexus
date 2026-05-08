@@ -1374,6 +1374,7 @@ class SigmatiqNexus:
             "source": "sigmatiq_nexus",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        msg.update(narratives.build_window_late_event_narrative(msg))
         redis_key = f"nexus_window_late_event:{symbol}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
@@ -1878,6 +1879,7 @@ class SigmatiqNexus:
             "costly_side_avg_pricing_lag": summary["costly_side_avg_pricing_lag"],
             "source": "sigmatiq_nexus",
         }
+        msg.update(narratives.build_window_pricing_narrative(msg))
         redis_key = f"nexus_window_pricing:{symbol}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
@@ -2532,6 +2534,7 @@ class SigmatiqNexus:
             "window_end": slot["window_end"].isoformat(),
             "source": "sigmatiq_nexus",
         }
+        msg.update(narratives.build_lifecycle_reason_summary(msg))
         redis_key = f"nexus_spread_overlay:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
