@@ -523,15 +523,26 @@ def _canonical_aggressor(value) -> str:
         return ""
     if isinstance(value, (int, float)):
         code = int(value)
-        return {1: "B", 2: "A", 3: "M"}.get(code, "")
+        # Databento encodes side as ASCII in live msgpack payloads:
+        # A=65, B=66, N=78. Older/internal payloads may use 1/2/3.
+        return {1: "B", 2: "A", 3: "M", 65: "A", 66: "B", 78: "M"}.get(code, "")
     raw = str(value).strip().upper()
     if raw in {"A", "ASK", "BUY", "BOUGHT", "LIFT", "LIFTED"}:
         return "A"
     if raw in {"B", "BID", "SELL", "SOLD", "HIT"}:
         return "B"
-    if raw in {"M", "MID", "NEUTRAL", "N"}:
+    if raw in {"M", "MID", "NEUTRAL", "N", "NONE"}:
         return "M"
     return "" if raw in {"UNKNOWN", "UNK", "U", "0"} else raw
+
+
+def _canonical_option_side(value) -> str:
+    raw = str(value or "").strip().upper()
+    if raw in {"C", "CALL"}:
+        return "C"
+    if raw in {"P", "PUT"}:
+        return "P"
+    return ""
 
 
 def _derive_aggressor_from_quote(payload: dict, reference_time: datetime | None) -> str:
@@ -652,6 +663,8 @@ def _event_feature_status(payload: dict, raw_symbol: str | None) -> dict[str, st
 def normalize_trade_payload(payload: dict) -> dict:
     raw_symbol = payload.get("raw_symbol") or payload.get("rawSymbol")
     symbol = payload.get("symbol") or payload.get("underlying")
+    raw_side = payload.get("side")
+    option_side = _canonical_option_side(raw_side) or _option_side_from_raw_symbol(raw_symbol) or ""
     price = float(payload.get("price") or 0.0)
     size = float(payload.get("size") or payload.get("contracts") or 0.0)
     ts_utc = payload.get("ts_utc") or payload.get("timestamp")
@@ -662,6 +675,11 @@ def normalize_trade_payload(payload: dict) -> dict:
     reference_time = parse_event_datetime(payload) if ts_utc or ts_event_ns else None
     previous_status = payload.get("_feature_status") if isinstance(payload.get("_feature_status"), dict) else {}
     raw_aggressor = None if previous_status.get("aggressor") in {"missing", "derived"} else _payload_value(payload, "aggressor", "trade_side", "tradeSide")
+    side_used_as_aggressor = False
+    if raw_aggressor is None and not _canonical_option_side(raw_side):
+        # OPRA live trades use `side` for aggressor/condition, not C/P.
+        raw_aggressor = raw_side
+        side_used_as_aggressor = raw_aggressor is not None
     aggressor = _canonical_aggressor(raw_aggressor)
     derived_aggressor = False
     if not aggressor:
@@ -682,7 +700,7 @@ def normalize_trade_payload(payload: dict) -> dict:
         "symbol": str(symbol or "").strip().upper(),
         "raw_symbol": raw_symbol,
         "ts_utc": ts_utc,
-        "side": str(payload.get("side") or _option_side_from_raw_symbol(raw_symbol) or "").strip().upper(),
+        "side": option_side,
         "premium": float(payload.get("premium") or price * size * 100.0),
         "is_sweep": is_sweep,
         "aggressor": aggressor,
@@ -706,6 +724,8 @@ def normalize_trade_payload(payload: dict) -> dict:
     if derived_aggressor:
         status_payload["aggressor"] = aggressor
         status_payload["_derived_aggressor"] = True
+    elif side_used_as_aggressor and aggressor:
+        status_payload["aggressor"] = aggressor
     elif previous_status.get("aggressor") == "missing" and "trade_side" not in status_payload and "tradeSide" not in status_payload:
         status_payload.pop("aggressor", None)
     if previous_status.get("delta") == "missing" and not _payload_datetime(status_payload, GREEK_FRESHNESS_FIELDS):
@@ -715,6 +735,8 @@ def normalize_trade_payload(payload: dict) -> dict:
     for target in ("underlying_mid", "option_mid", "quote_age_ms"):
         if target in normalized:
             status_payload[target] = normalized[target]
+    if option_side:
+        status_payload["side"] = option_side
     normalized["_feature_status"] = _event_feature_status(status_payload, raw_symbol)
     return normalized
 
@@ -1712,7 +1734,14 @@ class SigmatiqNexus:
                 return float(payload["ivRank"]), True, payload
             regime = str(payload.get("vrpRegime") or "").lower()
             mapped = {"cheap": 20.0, "fair": 50.0, "moderate": 60.0, "rich": 80.0, "elevated": 90.0}.get(regime)
-            return (mapped, True, payload) if mapped is not None else (default, False, payload)
+            if mapped is not None:
+                return mapped, True, payload
+            # Live VRP exists but may not yet carry historical rank/regime. Use
+            # the conservative default as a fresh fallback so diagnostics and
+            # window views can publish without inventing a cheap-vol signal.
+            if _payload_datetime(payload, CONTEXT_TIMESTAMP_FIELDS):
+                return default, True, payload
+            return default, False, payload
         except Exception:
             return default, False, {}
 

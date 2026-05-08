@@ -382,6 +382,10 @@ Current state:
 
 Timestamp-less context keys are blocked by default through `NEXUS_REQUIRE_CONTEXT_TIMESTAMPS=true`. This is intentional: scalar values can still be read by `get_context()`, but strategy gates require timestamped context before allowing live decisions.
 
+Live OPRA trade payloads use Databento `side` as trade-side/aggressor metadata, not option type. Nexus must derive option `side = C | P` from OSI `raw_symbol`; numeric Databento sides such as `65`, `66`, and `78` map to aggressor `A`, `B`, and neutral/mid `M`. This prevents call/put premium windows from being flattened into `side=78`.
+
+When `options:live:vrp:{symbol}` is fresh but does not carry `ivRank` or a recognized `vrpRegime`, Nexus may satisfy the `iv_rank` quality gate with a conservative fallback value. This is for diagnostics/window views only; it must not create a cheap-vol signal.
+
 ## Enriched Option Market Context Feed
 
 Nexus also publishes a non-strategy market-context feed for `strategy-fit` and UI consumers. This feed is intentionally separate from `WINDOW_VIEW` and should not be interpreted as a trade recommendation.

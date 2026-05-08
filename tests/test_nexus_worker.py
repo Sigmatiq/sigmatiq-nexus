@@ -89,6 +89,44 @@ def test_decode_msgpack_stream_entry_derives_live_trade_fields():
     assert decoded["ts_utc"].startswith("2026-")
 
 
+def test_decode_msgpack_databento_trade_side_does_not_override_option_side():
+    payload = {
+        "underlying": "SPY",
+        "raw_symbol": "SPY   260508C00737000",
+        "price": 1.25,
+        "size": 4,
+        "side": 78,
+        "ts_event_ns": int(datetime(2026, 5, 8, 14, 10, tzinfo=timezone.utc).timestamp() * 1_000_000_000),
+    }
+
+    decoded = nw.decode_stream_entry({b"data": msgpack.packb(payload, use_bin_type=True)})
+
+    assert decoded["side"] == "C"
+    assert decoded["aggressor"] == "M"
+    assert decoded["is_sweep"] is False
+    assert decoded["_feature_status"]["side"] == "available"
+    assert decoded["_feature_status"]["aggressor"] == "available"
+    assert decoded["_feature_status"]["is_sweep"] == "derived"
+
+
+def test_decode_msgpack_databento_ask_side_trade_preserves_option_put_side():
+    payload = {
+        "underlying": "SPY",
+        "raw_symbol": "SPY   260508P00736000",
+        "price": 1.25,
+        "size": 1000,
+        "side": 65,
+        "ts_event_ns": int(datetime(2026, 5, 8, 14, 10, tzinfo=timezone.utc).timestamp() * 1_000_000_000),
+    }
+
+    decoded = nw.decode_stream_entry({b"data": msgpack.packb(payload, use_bin_type=True)})
+
+    assert decoded["side"] == "P"
+    assert decoded["aggressor"] == "A"
+    assert decoded["is_sweep"] is True
+    assert decoded["premium"] == 125_000.0
+
+
 def test_contract_details_from_raw_symbol_parses_expiry_strike_and_side():
     details = nw._contract_details_from_raw_symbol("SPY   260505P00719000")
 
@@ -197,6 +235,26 @@ def test_open_specialist_uses_cheap_call_dominance_for_1000_entry():
 
     assert asyncio.run(worker.check_open_specialist_heuristic(df, "SPY", nw.DECISION_SLOTS[0])) == ("BULLISH", True)
     assert asyncio.run(worker.check_open_specialist_heuristic(df, "SPY", nw.DECISION_SLOTS[1])) == (None, False)
+
+
+def test_vrp_payload_without_rank_satisfies_iv_rank_as_conservative_fallback():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:vrp:SPY": json.dumps({
+            "symbol": "SPY",
+            "tsUtc": "2026-05-05T14:00:00Z",
+            "atmIv": 0.42,
+            "vrp30d": 0.11,
+            "vrpRegime": "unknown",
+        })
+    })
+
+    iv_rank, _, _, status = asyncio.run(
+        worker.get_context_with_quality("SPY", datetime(2026, 5, 5, 14, 0, 30, tzinfo=timezone.utc))
+    )
+
+    assert iv_rank == 50.0
+    assert status["iv_rank"] == "fallback"
 
 
 def test_low_sweep_core_allows_only_research_windows_and_sides():
