@@ -11,6 +11,10 @@ Current lock model:
 - one independent final-trade lane per symbol per NY session
 - plus one shared group lock for `etf_confluence_sniper` across the configured ETF universe
 - this allows `SPY` and `QQQ` to fire independently while still keeping the group confluence lane single-fire
+- final single-leg locks are enforced in Redis with `SET NX`, not only process memory
+- active single-leg positions are persisted in Redis and restored when the worker starts during the same NY session
+- Redis Stream offsets are persisted per stream; the worker resumes from the last processed ID after restart
+- completed windows are evaluated only after the configured grace period, then marked evaluated once per `session_date + symbol + entry_time`
 
 ## Current Nexus Strategies
 
@@ -18,11 +22,13 @@ Current lock model:
 |---|---:|---:|---|
 | `etf_confluence_sniper` | Phase 1 primary | 10:00-12:30 ET | Flow plus pricing lag plus momentum alignment. |
 | `etf_open_specialist` | Phase 2 primary | 10:00 ET entry from 09:30-10:00 window | Cheap-call open rule: call premium dominates while IV rank is low. |
+| `etf_put_credit_open30_spread` | Research paper-only | 10:00 ET entry from 09:30-10:00 window | Bullish open30 call dominance expressed as a same-expiry put credit spread. |
+| `etf_call_credit_open30_spread` | Research paper-only | 10:00 ET entry from 09:30-10:00 window | Bearish open30 put dominance expressed as a same-expiry call credit spread. |
 | `etf_low_sweep_core` | Phase 2 compatibility | 10:00-10:30 ET entries | Low-sweep directional flow candidate retained from prior research. |
 | `etf_flow_specialist` | Phase 2 support | 10:30 ET entry from 10:00-10:30 window | Strong option-flow dominance with IV/GEX context. |
 | `etf_momentum_specialist` | Phase 2 support | 11:00 ET entry from 10:30-11:00 window | Underlying persistence plus option-flow confirmation. |
 
-All five implemented strategies also publish a per-window directional assessment for every completed window from `09:30-12:00` ET:
+All implemented strategies also publish a per-window directional assessment for every completed window from `09:30-12:00` ET:
 
 - `decision = WINDOW_VIEW`
 - `sentiment = BULLISH | BEARISH | CHOP`
@@ -34,6 +40,31 @@ Nexus also publishes a symbol-level window pricing summary for every completed w
 - `decision = WINDOW_PRICING`
 - includes `cheap_contract_*`, `costly_contract_*`, `cheap_side`, and `costly_side`
 - this is also informational only and separate from trade candidates
+
+Spread candidates publish separately from single-leg candidates:
+
+- `decision = BET`
+- `instrument_type = vertical_credit_spread`
+- `paper_only = true`
+- Redis key: `nexus_spread_overlay:{symbol}:{strategy}:{entry_label}`
+- Channel: `signal:spread:{strategy}`
+- Persistence: appended to `live:persistence:events` for EOD review
+- Runtime limitation: spread candidates are not managed by the current single-leg liquidation loop.
+
+Single-leg final candidates have an additional execution gate:
+
+- exact `raw_symbol` quote is fetched from `options:live:contract_state:{raw_symbol}` and `options:live:tradability:{raw_symbol}`
+- quote freshness must be acceptable and a reference price must exist
+- the recorded `entry_price` is the fresh quote reference, not a stale event-side value
+- if the quote gate fails, Nexus logs `strategy_final_blocked_by_quote` and publishes no final `BET`
+
+Current window-completion semantics:
+
+- the worker buffers live events by symbol
+- the scheduler checks due windows on every stream loop and after each processed event
+- a slot is due when `slot.entry + NEXUS_WINDOW_EVALUATION_GRACE_SECONDS` has passed in New York time
+- each window evaluates once per session/symbol/entry label
+- this is safer than first-event-after-boundary evaluation, but it is still not a true upstream ingestion watermark
 
 ## Feature Availability Summary
 
@@ -150,6 +181,50 @@ Minimum acceptable live behavior:
 - Missing fields should produce a reason such as `missing_contract_state`, not a numeric fallback that looks valid.
 - Runtime behavior: Nexus blocks this strategy when `delta`, `underlying_mid`, `option_mid`, or IV rank is missing.
 - Runtime freshness behavior: Nexus also blocks when quote/mid, Greek, underlying, or IV context age exceeds the configured limit.
+
+### `etf_put_credit_open30_spread`
+
+Required features:
+
+| Field | Why it matters | Current source | Status |
+|---|---|---|---|
+| `ts_utc` | Window assignment. | Raw option trade stream. | Available |
+| `symbol` | SPY/QQQ scope. | Stream config or event field. | Available |
+| `raw_symbol` | Short-leg identity and same-expiry long-leg construction. | Raw option trade stream. | Available |
+| `side` | Requires call-dominant open30 flow and put-leg candidate selection. | Event side or parsed contract. | Available |
+| `premium` | `$200k` window hurdle and side dominance. | Event premium. | Available |
+| `delta` | Selects short put closest to target absolute delta. | Contract-state enrichment. | Available with freshness gate |
+| `option_mid` | Ensures quote/mid enrichment is present before candidate selection. | Contract-state enrichment. | Available with freshness gate |
+| `iv_rank` | Keeps the live feature contract aligned with open30 volatility gating. | `stats:{symbol}:iv_rank` or live VRP fallback. | Partial |
+
+Minimum acceptable live behavior:
+
+- Runs only at the 10:00 ET decision using the completed 09:30-10:00 window.
+- SPY and QQQ are eligible.
+- Requires call premium dominance, IV rank below `NEXUS_SPREAD_MAX_IV_RANK`, a valid short put near target delta, a same-expiry lower-strike long put, fresh quotes for both legs, and net credit at or above `NEXUS_SPREAD_MIN_ENTRY_CREDIT`.
+- Publishes only paper spread candidates and does not update the single-leg active-position liquidation state.
+
+### `etf_call_credit_open30_spread`
+
+Required features:
+
+| Field | Why it matters | Current source | Status |
+|---|---|---|---|
+| `ts_utc` | Window assignment. | Raw option trade stream. | Available |
+| `symbol` | SPY-only scope from the current research memo. | Stream config or event field. | Available |
+| `raw_symbol` | Short-leg identity and same-expiry long-leg construction. | Raw option trade stream. | Available |
+| `side` | Requires put-dominant open30 flow and call-leg candidate selection. | Event side or parsed contract. | Available |
+| `premium` | `$200k` window hurdle and side dominance. | Event premium. | Available |
+| `delta` | Selects short call closest to target absolute delta. | Contract-state enrichment. | Available with freshness gate |
+| `option_mid` | Ensures quote/mid enrichment is present before candidate selection. | Contract-state enrichment. | Available with freshness gate |
+| `iv_rank` | Keeps the live feature contract aligned with open30 volatility gating. | `stats:{symbol}:iv_rank` or live VRP fallback. | Partial |
+
+Minimum acceptable live behavior:
+
+- Runs only at the 10:00 ET decision using the completed 09:30-10:00 window.
+- SPY is eligible; QQQ call-credit is intentionally excluded by current research posture.
+- Requires put premium dominance, IV rank below `NEXUS_SPREAD_MAX_IV_RANK`, a valid short call near target delta, a same-expiry higher-strike long call, fresh quotes for both legs, and net credit at or above `NEXUS_SPREAD_MIN_ENTRY_CREDIT`.
+- Publishes only paper spread candidates and does not update the single-leg active-position liquidation state.
 
 ## Recommended Reusable Live Feature Contracts
 
@@ -306,6 +381,21 @@ Current state:
 | Greeks | 60 seconds | `NEXUS_GREEK_MAX_AGE_SECONDS` |
 
 Timestamp-less context keys are blocked by default through `NEXUS_REQUIRE_CONTEXT_TIMESTAMPS=true`. This is intentional: scalar values can still be read by `get_context()`, but strategy gates require timestamped context before allowing live decisions.
+
+## Enriched Option Market Context Feed
+
+Nexus also publishes a non-strategy market-context feed for `strategy-fit` and UI consumers. This feed is intentionally separate from `WINDOW_VIEW` and should not be interpreted as a trade recommendation.
+
+| Artifact | Name | Notes |
+|---|---|---|
+| Completed-window key | `nexus_option_market_context:{symbol}:{window_id}` | Full payload for a completed 30-minute context window. |
+| Latest key | `nexus_option_market_context:{symbol}:latest` | Latest completed context window for API aggregation. |
+| Pub/Sub | `signal:option_market_context` | Full payload for subscribers. |
+
+Market-context windows run every 30 minutes from `09:30-16:00` ET, plus optional `16:00-16:15`. Strategy decision slots remain limited to researched strategy windows.
+
+Payload includes premium totals, call/put premium bias, trade/contract counts, most-traded contracts, cheapest/costliest contracts, cheap/costly side, liquidity quality, pricing quality, and late-event impact.
+
 ## Published Nexus Messages
 
 - `INTERMEDIATE`
@@ -323,6 +413,14 @@ Timestamp-less context keys are blocked by default through `NEXUS_REQUIRE_CONTEX
 - `WINDOW_PRICING`
   - Redis key: `nexus_window_pricing:{symbol}:{entry_label}`
   - Pub/Sub: `signal:window_pricing`
+- `WINDOW_LATE_EVENT`
+  - Redis key: `nexus_window_late_event:{symbol}:{entry_label}`
+  - Pub/Sub: `signal:window_late_event`
+  - Audit-only payload for delayed trades that belong to an already evaluated window; includes late event count, raw symbol, side, and call/put premium impact
+- `OPTION_MARKET_CONTEXT`
+  - Redis key: `nexus_option_market_context:{symbol}:{window_id}` and `nexus_option_market_context:{symbol}:latest`
+  - Pub/Sub: `signal:option_market_context`
+  - Full-session non-strategy market context for pricing and contract-activity consumers
 - `LIQUIDATE`
   - Redis key: `nexus_live_overlay:{symbol}`
   - Pub/Sub: `nexus_live_overlay:updates`

@@ -99,6 +99,22 @@ def test_contract_details_from_raw_symbol_parses_expiry_strike_and_side():
     }
 
 
+def test_raw_symbol_with_strike_rewrites_opra_strike():
+    assert nw._raw_symbol_with_strike("SPY   260505P00715000", 710.0) == "SPY260505P00710000"
+    assert nw._raw_symbol_with_strike("SPY   260505C00715000", 720.0) == "SPY260505C00720000"
+
+
+def test_raw_symbol_key_variants_include_compact_and_padded_opra_keys():
+    assert nw._raw_symbol_key_variants("SPY260505P00715000") == [
+        "SPY260505P00715000",
+        "SPY   260505P00715000",
+    ]
+    assert nw._raw_symbol_key_variants("SPY   260505P00715000") == [
+        "SPY   260505P00715000",
+        "SPY260505P00715000",
+    ]
+
+
 def test_feature_audit_blocks_raw_trade_payload_missing_strategy_fields():
     payload = {
         "underlying": "SPY",
@@ -118,6 +134,7 @@ def test_feature_audit_blocks_raw_trade_payload_missing_strategy_fields():
     assert "iv_rank" in audit["strategies"]["etf_open_specialist"]["missing"]
     assert "delta" in audit["strategies"]["etf_flow_specialist"]["missing"]
     assert "underlying_mid" in audit["strategies"]["etf_momentum_specialist"]["missing"]
+    assert "option_mid" in audit["strategies"]["etf_put_credit_open30_spread"]["missing"]
 
 
 def test_feature_audit_marks_enriched_payload_ready_for_all_strategies():
@@ -229,6 +246,10 @@ def test_confluence_pricing_lag_detects_cheap_option_after_underlying_move():
 def test_workflow_uses_configured_redis_host_variable():
     text = open(".github/workflows/deploy-nexus-prod.yml", encoding="utf-8").read()
 
+    assert "needs: test" in text
+    assert "actions/setup-python@v5" in text
+    assert 'python -m pip install -e ".[dev]"' in text
+    assert "python -m pytest -q" in text
     assert "CORE_REDIS_HOST" not in text
     assert "rg-sigmatiq-prod" in text
     assert "secrets.NEXUS_REDIS_URL" in text
@@ -236,6 +257,12 @@ def test_workflow_uses_configured_redis_host_variable():
     assert "NEXUS_SYMBOLS=SPY,QQQ" in text
     assert "NEXUS_FIRST_TRIGGER_SCOPE=symbol" in text
     assert "NEXUS_GROUP_LOCK_STRATEGIES=etf_confluence_sniper" in text
+
+
+def test_cluster_connection_does_not_disable_tls_verification():
+    text = open("src/sigmatiq_nexus/nexus_worker.py", encoding="utf-8").read()
+
+    assert "ssl_cert_reqs=None" not in text
 
 
 def test_default_symbols_and_scope_cover_combined_etf_sniper():
@@ -253,8 +280,16 @@ class FakeRedis:
     async def get(self, key):
         return self.values.get(key)
 
-    async def set(self, key, value):
+    async def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.values:
+            return False
+        self.values[key] = value
         self.sets.append((key, value))
+        return True
+
+    async def delete(self, key):
+        self.values.pop(key, None)
+        return 1
 
     async def publish(self, channel, value):
         self.publishes.append((channel, value))
@@ -306,6 +341,26 @@ def test_non_cluster_mode_uses_single_multi_stream_xread(monkeypatch):
     assert redis_client.calls == [(streams, 10, 1000)]
 
 
+def test_input_streams_default_to_persistent_start_id(monkeypatch):
+    monkeypatch.setattr(nw, "INPUT_STREAM", None)
+    monkeypatch.setattr(nw, "SYMBOLS", {"SPY"})
+    monkeypatch.setattr(nw, "STREAM_START_ID", "0-0")
+
+    assert nw.input_streams() == {"md:SPY:options:trades": "0-0"}
+
+
+def test_restore_and_persist_stream_offsets():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({nw.redis_stream_offset_key("md:SPY:options:trades"): "171-0"})
+    streams = {"md:SPY:options:trades": "0-0", "md:QQQ:options:trades": "0-0"}
+
+    asyncio.run(worker.restore_stream_offsets(streams))
+    asyncio.run(worker.persist_stream_offset("md:QQQ:options:trades", b"172-0"))
+
+    assert streams == {"md:SPY:options:trades": "171-0", "md:QQQ:options:trades": "0-0"}
+    assert worker.redis.values[nw.redis_stream_offset_key("md:QQQ:options:trades")] == "172-0"
+
+
 def test_publish_final_appends_live_persistence_event():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
@@ -325,7 +380,8 @@ def test_publish_final_appends_live_persistence_event():
 
     asyncio.run(worker._publish_final("etf_low_sweep_core", "SPY", "BULLISH", 1.0, 1.24, datetime(2026, 5, 5).date(), nw.DECISION_SLOTS[0], "SPY   260505C00720000"))
 
-    assert len(worker.redis.sets) == 1
+    overlay_sets = [(key, value) for key, value in worker.redis.sets if key == "nexus_live_overlay:SPY"]
+    assert len(overlay_sets) == 1
     assert len(worker.redis.xadds) == 1
     stream, fields, maxlen, approximate = worker.redis.xadds[0]
     assert stream == "live:persistence:events"
@@ -354,8 +410,69 @@ def test_publish_final_appends_live_persistence_event():
     assert payload["execution"]["reference_price"] == 1.24
     assert payload["execution"]["max_slippage_pct"] == nw.EXECUTION_MAX_SLIPPAGE_PCT
     assert payload["execution"]["quote_freshness"] == "available"
+    assert worker.redis.values[nw.redis_symbol_lock_key(datetime(2026, 5, 5).date(), "SPY")] == payload["signal_id"]
+    assert json.loads(worker.redis.values[nw.redis_active_position_key(datetime(2026, 5, 5).date(), "SPY")])["entry_price"] == 1.24
     assert maxlen == 10000
     assert approximate is True
+
+
+def test_publish_final_blocks_when_quote_is_missing():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.redis = FakeRedis()
+
+    asyncio.run(worker._publish_final("etf_low_sweep_core", "SPY", "BULLISH", 1.0, 1.24, datetime(2026, 5, 5).date(), nw.DECISION_SLOTS[0], "SPY   260505C00720000"))
+
+    assert not any(key == "nexus_live_overlay:SPY" for key, _ in worker.redis.sets)
+    assert not worker.already_signaled(datetime(2026, 5, 5).date(), "SPY", "etf_low_sweep_core")
+
+
+def test_publish_final_blocks_when_redis_lock_exists():
+    session_date = datetime(2026, 5, 5).date()
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.redis = FakeRedis({
+        nw.redis_symbol_lock_key(session_date, "SPY"): "sig_existing",
+        "options:live:contract_state:SPY   260505C00720000": json.dumps({
+            "optionMid": 1.24,
+            "bid": 1.20,
+            "ask": 1.28,
+            "asOfUtc": "2026-05-05T14:00:00Z",
+            "quoteAgeMs": 700,
+            "tradable": True,
+            "executable": True,
+            "tradabilityBucket": "tradable",
+        }),
+    })
+
+    asyncio.run(worker._publish_final("etf_low_sweep_core", "SPY", "BULLISH", 1.0, 1.24, session_date, nw.DECISION_SLOTS[0], "SPY   260505C00720000"))
+
+    assert not any(key == "nexus_live_overlay:SPY" for key, _ in worker.redis.sets)
+    assert nw.redis_active_position_key(session_date, "SPY") not in worker.redis.values
+
+
+def test_restore_active_positions_loads_current_session_symbol_state(monkeypatch):
+    monkeypatch.setattr(nw, "SYMBOLS", {"SPY", "QQQ"})
+    session_date = datetime(2026, 5, 5).date()
+    position = {
+        "entry_price": 1.24,
+        "is_guarded": False,
+        "side": "BULLISH",
+        "raw_symbol": "SPY   260505C00720000",
+        "signal_id": "sig_restore",
+        "position_id": "sig_restore",
+        "session_date": str(session_date),
+    }
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.last_reset_session_date = session_date
+    worker.active_positions = {}
+    worker.redis = FakeRedis({nw.redis_active_position_key(session_date, "SPY"): json.dumps(position)})
+
+    asyncio.run(worker.restore_active_positions())
+
+    assert worker.active_positions == {"SPY": position}
 
 
 def test_publish_intermediate_sets_key_and_appends_persistence_event():
@@ -517,6 +634,168 @@ def test_publish_window_pricing_sets_key_and_side_summary():
     assert payload["cheap_side"] in {"C", "P"}
     assert payload["costly_side"] in {"C", "P"}
     assert worker.redis.publishes[0][0] == "signal:window_pricing"
+
+
+def _contract_state(mid: float, bid: float, ask: float) -> str:
+    return json.dumps({
+        "optionMid": mid,
+        "bid": bid,
+        "ask": ask,
+        "asOfUtc": "2026-05-05T14:00:00Z",
+        "quoteAgeMs": 500,
+        "tradable": True,
+        "executable": True,
+        "tradabilityBucket": "tradable",
+    })
+
+
+def test_put_credit_open30_spread_publishes_paper_bet():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.redis = FakeRedis({
+        "options:live:vrp:SPY": json.dumps({"ivRank": 20, "asOf": "2026-05-05T13:50:00Z"}),
+        "options:live:contract_state:SPY   260505P00715000": _contract_state(0.575, 0.55, 0.60),
+        "options:live:contract_state:SPY   260505P00710000": _contract_state(0.175, 0.15, 0.20),
+    })
+    df = pl.DataFrame([
+        {
+            **row("2026-05-05T13:35:00Z", "C", 250_000),
+            "raw_symbol": "SPY   260505C00725000",
+            "delta": 0.50,
+            "option_mid": 2.0,
+            "quote_age_ms": 500,
+        },
+        {
+            **row("2026-05-05T13:50:00Z", "P", 20_000),
+            "raw_symbol": "SPY   260505P00715000",
+            "delta": -0.16,
+            "option_mid": 0.575,
+            "quote_age_ms": 500,
+        },
+    ])
+
+    asyncio.run(worker.evaluate_put_credit_open30_spread(df, "SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
+
+    spread_payloads = [
+        json.loads(value)
+        for key, value in worker.redis.sets
+        if key == "nexus_spread_overlay:SPY:etf_put_credit_open30_spread:10:00"
+    ]
+    assert len(spread_payloads) == 1
+    payload = spread_payloads[0]
+    assert payload["decision"] == "BET"
+    assert payload["instrument_type"] == "vertical_credit_spread"
+    assert payload["paper_only"] is True
+    assert payload["entry_credit"] == 0.35
+    assert payload["quote_freshness"] == "available"
+    assert payload["spread"]["spread_type"] == "put_credit"
+    assert payload["spread"]["max_loss_assumption"] == "AT_EXPIRATION_NO_ASSIGNMENT"
+    assert [(leg["action"], leg["raw_symbol"]) for leg in payload["legs"]] == [
+        ("SELL", "SPY260505P00715000"),
+        ("BUY", "SPY260505P00710000"),
+    ]
+    assert payload["execution"]["price_reference"] == "net_credit"
+    assert "SPY" not in worker.active_positions
+    assert not worker.already_signaled(datetime(2026, 5, 5).date(), "SPY", "etf_open_specialist")
+    assert worker.redis.xadds[-1][1]["redis_key"] == "nexus_spread_overlay:SPY:etf_put_credit_open30_spread:10:00"
+    assert worker.redis.publishes[-1][0] == "signal:spread:etf_put_credit_open30_spread"
+
+
+def test_call_credit_open30_spread_is_spy_only_and_publishes():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.redis = FakeRedis({
+        "options:live:vrp:SPY": json.dumps({"ivRank": 20, "asOf": "2026-05-05T13:50:00Z"}),
+        "options:live:contract_state:SPY260505C00725000": _contract_state(0.575, 0.55, 0.60),
+        "options:live:contract_state:SPY260505C00730000": _contract_state(0.175, 0.15, 0.20),
+    })
+    df = pl.DataFrame([
+        {
+            **row("2026-05-05T13:35:00Z", "P", 250_000),
+            "raw_symbol": "SPY   260505P00715000",
+            "delta": -0.50,
+            "option_mid": 2.0,
+            "quote_age_ms": 500,
+        },
+        {
+            **row("2026-05-05T13:50:00Z", "C", 20_000),
+            "raw_symbol": "SPY   260505C00725000",
+            "delta": 0.16,
+            "option_mid": 0.575,
+            "quote_age_ms": 500,
+        },
+    ])
+
+    assert asyncio.run(worker.check_call_credit_open30_spread(df, "QQQ", nw.DECISION_SLOTS[0])) == (None, False)
+    asyncio.run(worker.evaluate_call_credit_open30_spread(df, "SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
+
+    payload = json.loads([
+        value
+        for key, value in worker.redis.sets
+        if key == "nexus_spread_overlay:SPY:etf_call_credit_open30_spread:10:00"
+    ][0])
+    assert payload["sentiment"] == "BEARISH"
+    assert payload["spread"]["spread_type"] == "call_credit"
+    assert [(leg["action"], leg["raw_symbol"]) for leg in payload["legs"]] == [
+        ("SELL", "SPY260505C00725000"),
+        ("BUY", "SPY260505C00730000"),
+    ]
+
+
+def test_spread_candidate_rejects_low_credit():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.redis = FakeRedis({
+        "options:live:vrp:SPY": json.dumps({"ivRank": 20, "asOf": "2026-05-05T13:50:00Z"}),
+        "options:live:contract_state:SPY260505P00715000": _contract_state(0.575, 0.25, 0.60),
+        "options:live:contract_state:SPY260505P00710000": _contract_state(0.175, 0.15, 0.20),
+    })
+    df = pl.DataFrame([
+        {
+            **row("2026-05-05T13:35:00Z", "C", 250_000),
+            "raw_symbol": "SPY   260505C00725000",
+            "delta": 0.50,
+            "option_mid": 2.0,
+            "quote_age_ms": 500,
+        },
+        {
+            **row("2026-05-05T13:50:00Z", "P", 20_000),
+            "raw_symbol": "SPY   260505P00715000",
+            "delta": -0.16,
+            "option_mid": 0.575,
+            "quote_age_ms": 500,
+        },
+    ])
+
+    asyncio.run(worker.evaluate_put_credit_open30_spread(df, "SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
+
+    assert not any(key.startswith("nexus_spread_overlay:") for key, _ in worker.redis.sets)
+
+
+def test_spread_open30_rejects_high_iv_rank():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({"options:live:vrp:SPY": json.dumps({"ivRank": 35, "asOf": "2026-05-05T13:50:00Z"})})
+    df = pl.DataFrame([
+        {
+            **row("2026-05-05T13:35:00Z", "C", 250_000),
+            "raw_symbol": "SPY   260505C00725000",
+            "delta": 0.50,
+            "option_mid": 2.0,
+            "quote_age_ms": 500,
+        },
+        {
+            **row("2026-05-05T13:50:00Z", "P", 20_000),
+            "raw_symbol": "SPY   260505P00715000",
+            "delta": -0.16,
+            "option_mid": 0.575,
+            "quote_age_ms": 500,
+        },
+    ])
+
+    assert asyncio.run(worker.check_put_credit_open30_spread(df, "SPY", nw.DECISION_SLOTS[0])) == (None, False)
 
 
 def test_enrich_trade_payload_from_redis_merges_underlying_and_contract_state():
@@ -938,7 +1217,18 @@ def test_runtime_gate_allows_enriched_low_sweep_signal():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
     worker.active_positions = {}
-    worker.redis = FakeRedis()
+    worker.redis = FakeRedis({
+        "options:live:contract_state:SPY   260505C00700000": json.dumps({
+            "optionMid": 12.4,
+            "bid": 12.3,
+            "ask": 12.5,
+            "asOfUtc": "2026-05-05T13:35:00Z",
+            "quoteAgeMs": 100,
+            "tradable": True,
+            "executable": True,
+            "tradabilityBucket": "tradable",
+        }),
+    })
     payload = {
         "symbol": "SPY",
         "raw_symbol": "SPY   260505C00700000",
@@ -956,11 +1246,11 @@ def test_runtime_gate_allows_enriched_low_sweep_signal():
 
     asyncio.run(worker.evaluate_low_sweep_core(df, "SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
 
-    assert len(worker.redis.sets) == 2
+    overlay_sets = [(key, value) for key, value in worker.redis.sets if key == "nexus_live_overlay:SPY"]
+    assert len(overlay_sets) == 1
     assert len(worker.redis.xadds) == 2
     assert worker.redis.sets[0][0] == "nexus_intermediate:SPY:etf_low_sweep_core:10:00"
-    assert worker.redis.sets[1][0] == "nexus_live_overlay:SPY"
-    final = json.loads(worker.redis.sets[1][1])
+    final = json.loads(overlay_sets[0][1])
     assert final["strategy"] == "etf_low_sweep_core"
     assert final["decision"] == "BET"
     assert final["raw_symbol"] == "SPY   260505C00700000"
@@ -1024,6 +1314,181 @@ def test_active_position_mid_uses_tracked_contract_not_unrelated_symbol_trade():
     assert liquidate["execution"]["quote_freshness"] == "stale"
 
 
+def test_process_message_waits_for_window_grace_before_evaluating(monkeypatch):
+    monkeypatch.setattr(nw, "WINDOW_EVALUATION_GRACE_SECONDS", 15)
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.redis = FakeRedis()
+    worker.last_reset_session_date = datetime(2026, 5, 5).date()
+    worker.buffers = {"SPY": deque(maxlen=10)}
+    worker.feature_blocks_reported = set()
+    worker.window_views_reported = set()
+    worker.window_pricing_reported = set()
+    worker.evaluated_windows = set()
+    calls = []
+
+    async def fake_evaluate(symbol, slot, event_dt_utc):
+        calls.append((symbol, slot["entry_label"]))
+
+    worker.evaluate_strategy = fake_evaluate
+    payload_before_grace = {
+        "symbol": "SPY",
+        "raw_symbol": "SPY   260505C00700000",
+        "ts_utc": "2026-05-05T14:00:05Z",
+        "side": "C",
+        "price": 1.0,
+        "size": 1,
+        "premium": 100.0,
+    }
+    payload_after_grace = {**payload_before_grace, "ts_utc": "2026-05-05T14:00:16Z"}
+
+    asyncio.run(worker.process_message({"payload": json.dumps(payload_before_grace)}))
+    asyncio.run(worker.process_message({"payload": json.dumps(payload_after_grace)}))
+
+    assert calls == [("SPY", "10:00")]
+    assert nw.window_eval_key(datetime(2026, 5, 5).date(), "SPY", "10:00") in worker.evaluated_windows
+
+
+def test_market_context_windows_continue_after_strategy_windows():
+    assert nw.MARKET_CONTEXT_WINDOWS[-1]["entry_label"] == "w1600_1615"
+    assert nw.MARKET_CONTEXT_WINDOWS[-1]["window_end"].isoformat() == "16:15:00"
+    assert nw.DECISION_SLOTS[-1]["entry_label"] == "12:00"
+
+
+def test_publish_option_market_context_sets_latest_and_publishes():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    worker.option_market_context_reported = set()
+    worker.late_window_impacts = {}
+    worker.buffers = {"SPY": deque(maxlen=10)}
+    rows = [
+        {
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00700000",
+            "side": "C",
+            "premium": 300_000.0,
+            "is_sweep": True,
+            "underlying_mid": 700.0,
+            "delta": 0.5,
+            "option_mid": 10.0,
+            "option_bid": 9.9,
+            "option_ask": 10.1,
+        },
+        {
+            "ts_utc": "2026-05-05T13:42:00Z",
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00700000",
+            "side": "C",
+            "premium": 150_000.0,
+            "is_sweep": False,
+            "underlying_mid": 702.0,
+            "delta": 0.5,
+            "option_mid": 10.7,
+            "option_bid": 10.6,
+            "option_ask": 10.8,
+        },
+        {
+            "ts_utc": "2026-05-05T13:50:00Z",
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505P00695000",
+            "side": "P",
+            "premium": 50_000.0,
+            "is_sweep": False,
+            "underlying_mid": 702.0,
+            "delta": -0.4,
+            "option_mid": 7.0,
+            "option_bid": 6.9,
+            "option_ask": 7.1,
+        },
+    ]
+    worker.buffers["SPY"].extend(rows)
+
+    asyncio.run(worker.publish_option_market_context_for_slot("SPY", nw.MARKET_CONTEXT_WINDOWS[0], datetime(2026, 5, 5).date()))
+
+    key = "nexus_option_market_context:SPY:w0930_1000"
+    assert key in worker.redis.values
+    assert "nexus_option_market_context:SPY:latest" in worker.redis.values
+    msg = json.loads(worker.redis.values[key])
+    assert msg["window_id"] == "w0930_1000"
+    assert msg["premium"]["net_premium_bias"] == "call_heavy"
+    assert msg["activity"]["trade_count"] == 3
+    assert msg["activity"]["contract_count"] == 2
+    assert msg["most_traded_contracts"][0]["raw_symbol"] == "SPY   260505C00700000"
+    assert msg["cheap_side"] in {"calls", "puts"}
+    assert msg["pricing_quality"] == "usable"
+    assert worker.redis.xadds[0][1]["redis_key"] == key
+    assert worker.redis.publishes[0][0] == "signal:option_market_context"
+
+
+def test_late_event_after_window_evaluation_publishes_audit_event():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.redis = FakeRedis()
+    worker.last_reset_session_date = datetime(2026, 5, 5).date()
+    worker.buffers = {"SPY": deque(maxlen=10)}
+    worker.feature_blocks_reported = set()
+    worker.window_views_reported = set()
+    worker.window_pricing_reported = set()
+    worker.evaluated_windows = {nw.window_eval_key(datetime(2026, 5, 5).date(), "SPY", "10:00")}
+    worker.late_window_impacts = {}
+
+    payload = {
+        "symbol": "SPY",
+        "raw_symbol": "SPY   260505P00700000",
+        "ts_utc": "2026-05-05T13:59:58Z",
+        "side": "P",
+        "price": 15.0,
+        "size": 200,
+        "premium": 300_000.0,
+    }
+
+    asyncio.run(worker.process_message({"payload": json.dumps(payload)}))
+
+    key = "nexus_window_late_event:SPY:10:00"
+    msg = json.loads(worker.redis.values[key])
+    assert msg["decision"] == "WINDOW_LATE_EVENT"
+    assert msg["entry_time"] == "10:00"
+    assert msg["raw_symbol"] == "SPY   260505P00700000"
+    assert msg["side"] == "P"
+    assert msg["late_event_count"] == 1
+    assert msg["late_put_premium"] == 300_000.0
+    assert worker.redis.xadds[0][1]["redis_key"] == key
+    assert worker.redis.publishes[0][0] == "signal:window_late_event"
+
+
+def test_event_before_window_evaluation_does_not_publish_late_audit():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.redis = FakeRedis()
+    worker.last_reset_session_date = datetime(2026, 5, 5).date()
+    worker.buffers = {"SPY": deque(maxlen=10)}
+    worker.feature_blocks_reported = set()
+    worker.window_views_reported = set()
+    worker.window_pricing_reported = set()
+    worker.evaluated_windows = set()
+    worker.late_window_impacts = {}
+
+    payload = {
+        "symbol": "SPY",
+        "raw_symbol": "SPY   260505C00700000",
+        "ts_utc": "2026-05-05T13:59:58Z",
+        "side": "C",
+        "price": 10.0,
+        "size": 200,
+        "premium": 200_000.0,
+    }
+
+    asyncio.run(worker.process_message({"payload": json.dumps(payload)}))
+
+    assert "nexus_window_late_event:SPY:10:00" not in worker.redis.values
+    assert worker.redis.xadds == []
+    assert worker.redis.publishes == []
+
+
 def test_evaluate_strategy_publishes_window_views_even_when_trade_locked():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = {nw.signal_key(datetime(2026, 5, 5).date(), "SPY", "*")}
@@ -1068,7 +1533,18 @@ def test_evaluate_strategy_publishes_window_views_even_when_trade_locked():
 def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
-    worker.redis = FakeRedis()
+    worker.redis = FakeRedis({
+        "options:live:contract_state:QQQ   260505C00500000": json.dumps({
+            "optionMid": 12.4,
+            "bid": 12.3,
+            "ask": 12.5,
+            "asOfUtc": "2026-05-05T13:35:00Z",
+            "quoteAgeMs": 100,
+            "tradable": True,
+            "executable": True,
+            "tradabilityBucket": "tradable",
+        }),
+    })
     worker.window_views_reported = set()
     worker.feature_blocks_reported = set()
     worker.active_positions = {}
@@ -1101,7 +1577,7 @@ def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
 
     async def open_specialist(df, symbol, slot, session_date):
         calls.append("open")
-        await worker._publish_final("etf_open_specialist", symbol, "BULLISH", 0.95, session_date, slot)
+        await worker._publish_final("etf_open_specialist", symbol, "BULLISH", 0.95, 0.0, session_date, slot, "QQQ   260505C00500000")
 
     async def hybrid(df, symbol, slot, session_date):
         calls.append("hybrid")
@@ -1114,7 +1590,11 @@ def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
     asyncio.run(worker.evaluate_strategy("QQQ", nw.DECISION_SLOTS[0], datetime(2026, 5, 5, 14, 5, tzinfo=timezone.utc)))
 
     assert calls == ["confluence", "open"]
-    bet_messages = [json.loads(value) for _, value in worker.redis.sets if json.loads(value).get("decision") == "BET"]
+    bet_messages = [
+        json.loads(value)
+        for key, value in worker.redis.sets
+        if key.startswith("nexus_live_overlay:")
+    ]
     assert len(bet_messages) == 1
 
 
@@ -1122,10 +1602,21 @@ def test_symbol_lane_does_not_lock_other_symbol():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
     worker.active_positions = {}
-    worker.redis = FakeRedis()
+    worker.redis = FakeRedis({
+        "options:live:contract_state:QQQ   260505C00500000": json.dumps({
+            "optionMid": 12.4,
+            "bid": 12.3,
+            "ask": 12.5,
+            "asOfUtc": "2026-05-05T14:00:00Z",
+            "quoteAgeMs": 100,
+            "tradable": True,
+            "executable": True,
+            "tradabilityBucket": "tradable",
+        }),
+    })
     session_date = datetime(2026, 5, 5).date()
 
-    asyncio.run(worker._publish_final("etf_open_specialist", "QQQ", "BULLISH", 0.95, session_date, nw.DECISION_SLOTS[0]))
+    asyncio.run(worker._publish_final("etf_open_specialist", "QQQ", "BULLISH", 0.95, 0.0, session_date, nw.DECISION_SLOTS[0], "QQQ   260505C00500000"))
 
     assert not worker.already_signaled(session_date, "SPY", "etf_open_specialist")
     assert worker.already_signaled(session_date, "QQQ", "etf_open_specialist")
@@ -1135,10 +1626,21 @@ def test_confluence_group_lock_blocks_other_symbol_confluence_only():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
     worker.active_positions = {}
-    worker.redis = FakeRedis()
+    worker.redis = FakeRedis({
+        "options:live:contract_state:QQQ   260505C00500000": json.dumps({
+            "optionMid": 12.4,
+            "bid": 12.3,
+            "ask": 12.5,
+            "asOfUtc": "2026-05-05T14:00:00Z",
+            "quoteAgeMs": 100,
+            "tradable": True,
+            "executable": True,
+            "tradabilityBucket": "tradable",
+        }),
+    })
     session_date = datetime(2026, 5, 5).date()
 
-    asyncio.run(worker._publish_final("etf_confluence_sniper", "QQQ", "BULLISH", 0.95, session_date, nw.DECISION_SLOTS[0]))
+    asyncio.run(worker._publish_final("etf_confluence_sniper", "QQQ", "BULLISH", 0.95, 0.0, session_date, nw.DECISION_SLOTS[0], "QQQ   260505C00500000"))
 
     assert worker.already_signaled(session_date, "SPY", "etf_confluence_sniper")
     assert not worker.already_signaled(session_date, "SPY", "etf_open_specialist")

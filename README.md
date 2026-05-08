@@ -16,24 +16,50 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 
 - Decisions are based on completed New York trading windows, not wall-clock time on the worker host.
 - `10:00` evaluates `09:30-10:00`, `10:30` evaluates `10:00-10:30`, `11:00` evaluates `10:30-11:00`, `11:30` evaluates `11:00-11:30`, and `12:00` evaluates `11:30-12:00`.
+- Completed windows are evaluated after `NEXUS_WINDOW_EVALUATION_GRACE_SECONDS`, so the first post-boundary trade does not immediately freeze the window.
+- If a trade arrives for a window that was already evaluated, Nexus publishes `WINDOW_LATE_EVENT` as audit-only evidence with late premium totals; it does not re-evaluate or re-trade that window.
+- Redis Stream offsets are persisted per input stream under `NEXUS_STREAM_OFFSET_KEY`, so worker restarts resume from the last processed ID instead of starting from new-only `$`.
 - First trigger wins by default per `session_date + symbol`, so each symbol has one independent trade lane per NY session.
+- Final single-leg `BET` messages acquire Redis-backed first-trigger locks before publishing, so restarts do not reopen the same symbol lane.
 - `etf_confluence_sniper` also participates in a separate shared group lock across the configured ETF universe, controlled by `NEXUS_GROUP_LOCK_STRATEGIES`.
 - Result: `SPY` and `QQQ` can each fire independently, while the group confluence lane still remains single-fire.
 - `etf_confluence_sniper` is evaluated first for each eligible window.
 - `etf_open_specialist` is the explicit 10:00 ET cheap-call rule for the completed 09:30-10:00 window.
+- `etf_put_credit_open30_spread` is the paper-only 10:00 ET vertical put-credit spread read for SPY/QQQ when open30 call premium dominates and a same-expiry spread can be quoted at the minimum credit.
+- `etf_call_credit_open30_spread` is the paper-only 10:00 ET vertical call-credit spread read for SPY only when open30 put premium dominates and a same-expiry spread can be quoted at the minimum credit.
 - `etf_low_sweep_core` remains available as the tested low-sweep candidate; `etf_flow_specialist` and `etf_momentum_specialist` are restricted to their researched 10:30 and 11:00 entry windows.
 - Every implemented strategy now publishes a per-window `WINDOW_VIEW` sentiment for every completed window from `09:30-12:00` ET, independent of whether that strategy is allowed to emit a trade candidate in that slot.
 - Nexus also publishes one per-window `WINDOW_PRICING` message per symbol/window with the cheapest contract, costliest contract, and cheap/costly side summary derived from pricing-lag inside that completed window.
 - Each strategy now has a fail-closed feature gate. If required live fields are missing, Nexus emits a stage `0` `BLOCKED` diagnostic on the same `nexus_window_view:{symbol}:{strategy}:{entry_label}` key family and skips the strategy instead of defaulting missing booleans/numbers.
 - Final `BET` payloads now carry the exact option `raw_symbol`, a live entry quote snapshot, quote freshness, quote-valid-until, and an explicit execution policy block. Runtime liquidation tracks that exact contract via `options:live:contract_state:{raw_symbol}` / `options:live:tradability:{raw_symbol}` instead of comparing against unrelated same-symbol option trades.
+- Single-leg final `BET` publishing fails closed when the exact contract has no fresh executable quote; the fresh quote reference becomes the recorded entry price.
+- Single-leg active positions are persisted to Redis and restored on worker startup for the current NY session.
+- Spread `BET` payloads are paper-only, publish to `nexus_spread_overlay:{symbol}:{strategy}:{entry_label}`, and are not attached to the current single-leg liquidation loop.
+
+
+## Enriched Option Market Context
+
+Nexus publishes a market-context feed separate from strategy signals. Strategy decisions remain limited to researched morning windows, but option market context continues across the full session.
+
+- Completed-window key: `nexus_option_market_context:{symbol}:{window_id}`
+- Latest key: `nexus_option_market_context:{symbol}:latest`
+- Pub/Sub: `signal:option_market_context`
+- Windows: every 30 minutes from `09:30-16:00` ET plus optional `16:00-16:15`
+- Purpose: provide premiums, heavily traded contracts, cheap/costly contracts, cheap/costly side, liquidity quality, pricing quality, and late-event impact to API/UI consumers
+- Boundary: this feed is not a strategy signal and does not use `WINDOW_VIEW` sentiment
 
 ## Runtime configuration
 
 - `REDIS_URL`: Redis connection URL used by the worker.
 - `NEXUS_REDIS_CLUSTER`: set to `true` for Azure clustered Redis. In cluster mode Nexus reads each configured input stream separately so Redis does not reject multi-key `XREAD` calls across hash slots.
 - `NEXUS_INPUT_STREAM`: optional explicit Redis stream. If absent, Nexus consumes `md:{symbol}:options:trades`.
+- `NEXUS_STREAM_START_ID`: initial Redis Stream ID when no stored offset exists, default `0-0`.
+- `NEXUS_STREAM_OFFSET_KEY`: Redis key template for saved stream offsets, default `nexus:stream_offset:{stream}`.
 - `NEXUS_SYMBOLS`: comma-separated symbols to process, default `SPY,QQQ`.
 - `NEXUS_GROUP_LOCK_STRATEGIES`: comma-separated strategy names that should also share one cross-symbol group lock, default `etf_confluence_sniper`.
+- `NEXUS_LOCK_TTL_SECONDS`: Redis first-trigger lock TTL, default `28800`.
+- `NEXUS_ACTIVE_POSITION_TTL_SECONDS`: Redis active-position state TTL, default `28800`.
+- `NEXUS_WINDOW_EVALUATION_GRACE_SECONDS`: delay after a decision boundary before evaluating the completed window, default `15`.
 - `NEXUS_IV_RANK_KEY`, `NEXUS_ATM_IV_KEY`, `NEXUS_NET_GEX_KEY`: optional direct Redis key templates for live context, each using `{symbol}`.
 - `NEXUS_IV_SURFACE_KEY`, `NEXUS_VRP_KEY`, `NEXUS_GEX_KEY`: live options-worker fallback key templates, defaulting to `options:live:*:{symbol}` keys.
 - `NEXUS_EQUITY_CONTEXT_KEY`: equity live context key template, default `equity:live:context:{symbol}`.
@@ -47,6 +73,11 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - `NEXUS_GREEK_MAX_AGE_SECONDS`: max Greek age on enriched events, default `60`.
 - `NEXUS_SWEEP_PREMIUM_USD`: quote-derived sweep threshold when raw `is_sweep` is absent, default `25000`.
 - `NEXUS_EXECUTION_MAX_SLIPPAGE_PCT`: slippage ceiling published in `BET` and `LIQUIDATE` execution blocks, default `5.0`.
+- `NEXUS_SPREAD_STRIKE_WIDTH`: vertical spread width, default `5.0`.
+- `NEXUS_SPREAD_TARGET_DELTA`: target absolute short-leg delta for spread candidate selection, default `0.15`.
+- `NEXUS_SPREAD_MIN_ENTRY_CREDIT`: minimum net credit required before a spread `BET` is published, default `0.30`.
+- `NEXUS_SPREAD_MAX_IV_RANK`: maximum IV rank allowed for spread open30 candidates, default `30.0`.
+- `NEXUS_SPREAD_TAKE_PROFIT_PCT`, `NEXUS_SPREAD_STOP_LOSS_PCT`, `NEXUS_SPREAD_HOLD_SECONDS`: paper spread risk metadata, defaults `20.0`, `75.0`, and `1800`.
 - `NEXUS_MIN_WINDOW_PREMIUM` and `NEXUS_SIDE_DOMINANCE`: window-level premium and side-dominance thresholds.
 - `NEXUS_OPEN_CALL_DOMINANCE`: opening cheap-call dominance threshold, default `1.5`.
 - `LIVE_PERSISTENCE_EVENT_STREAM`: Redis Stream for durable signal capture, default `live:persistence:events`.
@@ -74,11 +105,15 @@ Nexus now emits structured JSON logs for the decision path so production checks 
 
 - `worker_started`, `redis_connected`, `stream_batch_received`: confirms the worker is alive and reading Redis streams.
 - `slot_candidate_received`, `window_evaluation_started`: confirms events are arriving for a symbol and a completed NY window is being evaluated with real premium totals.
+- `stream_offsets_restored`: confirms Redis Stream restart offsets were loaded.
+- `window_due_for_evaluation`: confirms a completed window passed the configured grace period and is being evaluated.
+- `window_late_event_detected`: confirms a delayed trade landed after its window was already evaluated and was recorded as audit-only impact.
 - `strategy_blocked`: emitted when fail-closed feature gates reject a strategy due to missing or stale live fields.
 - `strategy_window_view_published`: emitted when a strategy publishes its directional read of a completed window as `BULLISH`, `BEARISH`, or `CHOP`.
-- `window_pricing_published`: emitted when Nexus publishes the separate cheap-versus-costly contract summary for the completed window.
+- `window_pricing_published`: emitted when Nexus publishes the separate cheap-versus-costly contract summary for the completed strategy window.
+- `option_market_context_published`: emitted when Nexus publishes full-session enriched option market context for a completed market-context window.
 - `strategy_no_signal`: emitted when data is present but the heuristic or model threshold did not qualify.
-- `strategy_intermediate_published`, `strategy_final_published`, `position_liquidated`: emitted when Nexus actually produces a signal or exits a live position.
+- `strategy_intermediate_published`, `strategy_final_published`, `strategy_spread_final_published`, `position_liquidated`: emitted when Nexus actually produces a signal or exits a live position.
 
 Example grep targets:
 

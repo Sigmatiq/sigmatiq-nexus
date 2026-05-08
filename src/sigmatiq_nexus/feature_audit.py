@@ -76,6 +76,26 @@ STRATEGY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "option_mid",
         "iv_rank",
     ),
+    "etf_put_credit_open30_spread": (
+        "ts_utc",
+        "symbol",
+        "raw_symbol",
+        "side",
+        "premium",
+        "delta",
+        "option_mid",
+        "iv_rank",
+    ),
+    "etf_call_credit_open30_spread": (
+        "ts_utc",
+        "symbol",
+        "raw_symbol",
+        "side",
+        "premium",
+        "delta",
+        "option_mid",
+        "iv_rank",
+    ),
 }
 
 

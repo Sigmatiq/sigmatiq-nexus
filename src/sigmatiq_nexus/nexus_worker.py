@@ -22,6 +22,7 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 REDIS_CLUSTER = os.environ.get("NEXUS_REDIS_CLUSTER", "false").strip().lower() == "true"
 SYMBOLS = {s.strip().upper() for s in os.environ.get("NEXUS_SYMBOLS", "SPY,QQQ").split(",") if s.strip()}
 INPUT_STREAM = os.environ.get("NEXUS_INPUT_STREAM")
+STREAM_START_ID = os.environ.get("NEXUS_STREAM_START_ID", "0-0")
 FIRST_TRIGGER_SCOPE = os.environ.get("NEXUS_FIRST_TRIGGER_SCOPE", "symbol").strip().lower()
 GROUP_LOCK_STRATEGIES = {
     s.strip()
@@ -32,6 +33,10 @@ MIN_WINDOW_PREMIUM = float(os.environ.get("NEXUS_MIN_WINDOW_PREMIUM", "200000"))
 SIDE_DOMINANCE = float(os.environ.get("NEXUS_SIDE_DOMINANCE", "2.0"))
 OPEN_CALL_DOMINANCE = float(os.environ.get("NEXUS_OPEN_CALL_DOMINANCE", "1.5"))
 LIVE_PERSISTENCE_EVENT_STREAM = os.environ.get("LIVE_PERSISTENCE_EVENT_STREAM", "live:persistence:events")
+STREAM_OFFSET_KEY_TEMPLATE = os.environ.get("NEXUS_STREAM_OFFSET_KEY", "nexus:stream_offset:{stream}")
+LOCK_TTL_SECONDS = int(os.environ.get("NEXUS_LOCK_TTL_SECONDS", str(60 * 60 * 8)))
+ACTIVE_POSITION_TTL_SECONDS = int(os.environ.get("NEXUS_ACTIVE_POSITION_TTL_SECONDS", str(60 * 60 * 8)))
+WINDOW_EVALUATION_GRACE_SECONDS = int(os.environ.get("NEXUS_WINDOW_EVALUATION_GRACE_SECONDS", "15"))
 
 IV_RANK_KEY_TEMPLATE = os.environ.get("NEXUS_IV_RANK_KEY", "stats:{symbol}:iv_rank")
 ATM_IV_KEY_TEMPLATE = os.environ.get("NEXUS_ATM_IV_KEY", "stats:{symbol}:atm_iv")
@@ -55,6 +60,13 @@ STOP_LOSS_PCT = float(os.environ.get("NEXUS_STOP_LOSS_PCT", "-50.0"))
 GUARD_ACTIVATE_PCT = float(os.environ.get("NEXUS_GUARD_ACTIVATE_PCT", "15.0"))
 GUARD_FLOOR_PCT = float(os.environ.get("NEXUS_GUARD_FLOOR_PCT", "5.0"))
 EXECUTION_MAX_SLIPPAGE_PCT = float(os.environ.get("NEXUS_EXECUTION_MAX_SLIPPAGE_PCT", "5.0"))
+SPREAD_STRIKE_WIDTH = float(os.environ.get("NEXUS_SPREAD_STRIKE_WIDTH", "5.0"))
+SPREAD_TARGET_DELTA = float(os.environ.get("NEXUS_SPREAD_TARGET_DELTA", "0.15"))
+SPREAD_MIN_ENTRY_CREDIT = float(os.environ.get("NEXUS_SPREAD_MIN_ENTRY_CREDIT", "0.30"))
+SPREAD_TAKE_PROFIT_PCT = float(os.environ.get("NEXUS_SPREAD_TAKE_PROFIT_PCT", "20.0"))
+SPREAD_STOP_LOSS_PCT = float(os.environ.get("NEXUS_SPREAD_STOP_LOSS_PCT", "75.0"))
+SPREAD_HOLD_SECONDS = int(os.environ.get("NEXUS_SPREAD_HOLD_SECONDS", "1800"))
+SPREAD_MAX_IV_RANK = float(os.environ.get("NEXUS_SPREAD_MAX_IV_RANK", "30.0"))
 
 MODEL_V6_PATH = os.environ.get("NEXUS_V6_MODEL", "models/hybrid_spy_v6.onnx")
 SCALER_V6_PATH = os.environ.get("NEXUS_V6_SCALER", "models/hybrid_scaler_v6.npz")
@@ -69,6 +81,22 @@ DECISION_SLOTS = [
     {"entry": time(11, 0), "end": time(11, 30), "window_start": time(10, 30), "window_end": time(11, 0), "entry_label": "11:00"},
     {"entry": time(11, 30), "end": time(12, 0), "window_start": time(11, 0), "window_end": time(11, 30), "entry_label": "11:30"},
     {"entry": time(12, 0), "end": time(12, 30), "window_start": time(11, 30), "window_end": time(12, 0), "entry_label": "12:00"},
+]
+MARKET_CONTEXT_WINDOWS = [
+    {"entry": time(10, 0), "end": time(10, 0), "window_start": time(9, 30), "window_end": time(10, 0), "entry_label": "w0930_1000"},
+    {"entry": time(10, 30), "end": time(10, 30), "window_start": time(10, 0), "window_end": time(10, 30), "entry_label": "w1000_1030"},
+    {"entry": time(11, 0), "end": time(11, 0), "window_start": time(10, 30), "window_end": time(11, 0), "entry_label": "w1030_1100"},
+    {"entry": time(11, 30), "end": time(11, 30), "window_start": time(11, 0), "window_end": time(11, 30), "entry_label": "w1100_1130"},
+    {"entry": time(12, 0), "end": time(12, 0), "window_start": time(11, 30), "window_end": time(12, 0), "entry_label": "w1130_1200"},
+    {"entry": time(12, 30), "end": time(12, 30), "window_start": time(12, 0), "window_end": time(12, 30), "entry_label": "w1200_1230"},
+    {"entry": time(13, 0), "end": time(13, 0), "window_start": time(12, 30), "window_end": time(13, 0), "entry_label": "w1230_1300"},
+    {"entry": time(13, 30), "end": time(13, 30), "window_start": time(13, 0), "window_end": time(13, 30), "entry_label": "w1300_1330"},
+    {"entry": time(14, 0), "end": time(14, 0), "window_start": time(13, 30), "window_end": time(14, 0), "entry_label": "w1330_1400"},
+    {"entry": time(14, 30), "end": time(14, 30), "window_start": time(14, 0), "window_end": time(14, 30), "entry_label": "w1400_1430"},
+    {"entry": time(15, 0), "end": time(15, 0), "window_start": time(14, 30), "window_end": time(15, 0), "entry_label": "w1430_1500"},
+    {"entry": time(15, 30), "end": time(15, 30), "window_start": time(15, 0), "window_end": time(15, 30), "entry_label": "w1500_1530"},
+    {"entry": time(16, 0), "end": time(16, 0), "window_start": time(15, 30), "window_end": time(16, 0), "entry_label": "w1530_1600"},
+    {"entry": time(16, 15), "end": time(16, 15), "window_start": time(16, 0), "window_end": time(16, 15), "entry_label": "w1600_1615"},
 ]
 EVENT_FEATURES = {
     "ts_utc",
@@ -159,6 +187,26 @@ STRATEGY_REQUIRED_FEATURES = {
         "side",
         "premium",
         "underlying_mid",
+        "delta",
+        "option_mid",
+        "iv_rank",
+    ),
+    "etf_put_credit_open30_spread": (
+        "ts_utc",
+        "symbol",
+        "raw_symbol",
+        "side",
+        "premium",
+        "delta",
+        "option_mid",
+        "iv_rank",
+    ),
+    "etf_call_credit_open30_spread": (
+        "ts_utc",
+        "symbol",
+        "raw_symbol",
+        "side",
+        "premium",
         "delta",
         "option_mid",
         "iv_rank",
@@ -304,10 +352,18 @@ def decision_slot(dt_utc: datetime) -> dict | None:
     return None
 
 
+def event_window_slot(dt_utc: datetime) -> dict | None:
+    t = dt_utc.astimezone(NY).time()
+    for slot in DECISION_SLOTS:
+        if slot["window_start"] <= t < slot["window_end"]:
+            return slot
+    return None
+
+
 def input_streams() -> dict[str, str]:
     if INPUT_STREAM:
-        return {INPUT_STREAM: "$"}
-    return {f"md:{symbol}:options:trades": "$" for symbol in sorted(SYMBOLS)}
+        return {INPUT_STREAM: STREAM_START_ID}
+    return {f"md:{symbol}:options:trades": STREAM_START_ID for symbol in sorted(SYMBOLS)}
 
 
 async def read_input_streams(redis_client, streams: dict[str, str]):
@@ -331,6 +387,30 @@ def symbol_lane_key(session_date, symbol: str) -> str:
 
 def group_lock_key(session_date, strategy: str) -> str:
     return f"{session_date}:group:{strategy}"
+
+
+def redis_symbol_lock_key(session_date, symbol: str) -> str:
+    return f"nexus:lock:{session_date}:{symbol}"
+
+
+def redis_strategy_lock_key(session_date, symbol: str, strategy: str) -> str:
+    return f"nexus:lock:{session_date}:{symbol}:{strategy}"
+
+
+def redis_group_lock_key(session_date, strategy: str) -> str:
+    return f"nexus:lock:{session_date}:group:{strategy}"
+
+
+def redis_active_position_key(session_date, symbol: str) -> str:
+    return f"nexus:active_position:{session_date}:{symbol}"
+
+
+def redis_stream_offset_key(stream_name: str) -> str:
+    return STREAM_OFFSET_KEY_TEMPLATE.format(stream=stream_name)
+
+
+def window_eval_key(session_date, symbol: str, entry_label: str) -> str:
+    return f"{session_date}:{symbol}:{entry_label}"
 
 
 def _option_side_from_raw_symbol(raw_symbol: str | None) -> str | None:
@@ -358,6 +438,35 @@ def _contract_details_from_raw_symbol(raw_symbol: str | None) -> dict[str, str |
         }
     except Exception:
         return {"expiry_date": None, "strike": None, "side": _option_side_from_raw_symbol(raw_symbol)}
+
+
+def _raw_symbol_with_strike(raw_symbol: str | None, strike: float) -> str | None:
+    if not raw_symbol:
+        return None
+    compact = str(raw_symbol).replace(" ", "").upper()
+    if len(compact) < 15:
+        return None
+    try:
+        strike_raw = f"{int(round(float(strike) * 1000)):08d}"
+    except (TypeError, ValueError):
+        return None
+    return f"{compact[:-8]}{strike_raw}"
+
+
+def _raw_symbol_key_variants(raw_symbol: str | None) -> list[str]:
+    if not raw_symbol:
+        return []
+    raw = str(raw_symbol).strip().upper()
+    compact = raw.replace(" ", "")
+    variants = []
+    for value in (raw, compact):
+        if value and value not in variants:
+            variants.append(value)
+    if len(compact) >= 15:
+        padded = f"{compact[:-15].ljust(6)}{compact[-15:]}"
+        if padded not in variants:
+            variants.append(padded)
+    return variants
 
 
 def _payload_has_any(payload: dict, *names: str) -> str | None:
@@ -788,6 +897,9 @@ class SigmatiqNexus:
         self.feature_blocks_reported = set()
         self.window_views_reported = set()
         self.window_pricing_reported = set()
+        self.option_market_context_reported = set()
+        self.evaluated_windows = set()
+        self.late_window_impacts = {}
         self.redis = None
 
     def _log(self, event: str, **fields) -> None:
@@ -917,23 +1029,126 @@ class SigmatiqNexus:
             "costly_side_avg_pricing_lag": round(float(side_avgs[costly_side]), 6) if costly_side else None,
         }
 
+    def _contract_contexts(self, df: pl.DataFrame, profiles: list[dict]) -> list[dict]:
+        if df.is_empty() or "raw_symbol" not in df.columns:
+            return []
+        profile_by_raw = {p["raw_symbol"]: p for p in profiles}
+        contexts = []
+        for row in (
+            df.group_by("raw_symbol")
+            .agg([
+                pl.col("premium").cast(pl.Float64, strict=False).fill_null(0).sum().alias("premium"),
+                pl.len().alias("trade_count"),
+                pl.col("side").cast(pl.Utf8).drop_nulls().last().alias("side"),
+                pl.col("option_mid").cast(pl.Float64, strict=False).drop_nulls().last().alias("option_mid") if "option_mid" in df.columns else pl.lit(None).alias("option_mid"),
+                pl.col("option_bid").cast(pl.Float64, strict=False).drop_nulls().last().alias("option_bid") if "option_bid" in df.columns else pl.lit(None).alias("option_bid"),
+                pl.col("option_ask").cast(pl.Float64, strict=False).drop_nulls().last().alias("option_ask") if "option_ask" in df.columns else pl.lit(None).alias("option_ask"),
+            ])
+            .sort("premium", descending=True)
+            .to_dicts()
+        ):
+            raw_symbol = row.get("raw_symbol")
+            details = _contract_details_from_raw_symbol(raw_symbol)
+            option_mid = row.get("option_mid")
+            bid = row.get("option_bid")
+            ask = row.get("option_ask")
+            spread_pct = None
+            if option_mid not in (None, 0) and bid is not None and ask is not None:
+                spread_pct = round(float((ask - bid) / option_mid * 100.0), 4)
+            profile = profile_by_raw.get(raw_symbol, {})
+            contexts.append({
+                "raw_symbol": raw_symbol,
+                "expiry": details["expiry_date"],
+                "strike": details["strike"],
+                "side": str(row.get("side") or details["side"] or ""),
+                "premium": float(row.get("premium") or 0.0),
+                "trade_count": int(row.get("trade_count") or 0),
+                "option_mid": float(option_mid) if option_mid not in (None, "") else None,
+                "bid_ask_spread_pct": spread_pct,
+                "pricing_lag": profile.get("pricing_lag"),
+                "cheapness_score": profile.get("cheapness_score"),
+            })
+        return contexts
+
+    def _option_market_context_payload(self, df: pl.DataFrame, symbol: str, slot: dict, session_date) -> dict:
+        stats = window_stats(df)
+        pricing_summary = self._window_pricing_summary(df)
+        profiles = pricing_summary.get("profiles") or []
+        contexts = self._contract_contexts(df, profiles)
+        cheapest_raws = {p["raw_symbol"] for p in sorted(profiles, key=lambda p: p["pricing_lag"])[:5]}
+        costliest_raws = {p["raw_symbol"] for p in sorted(profiles, key=lambda p: p["pricing_lag"], reverse=True)[:5]}
+        most_traded = sorted(contexts, key=lambda c: (c["premium"], c["trade_count"]), reverse=True)[:5]
+        cheapest = [c for c in contexts if c["raw_symbol"] in cheapest_raws][:5]
+        costliest = [c for c in contexts if c["raw_symbol"] in costliest_raws][:5]
+        spread_values = [c["bid_ask_spread_pct"] for c in contexts if c.get("bid_ask_spread_pct") is not None]
+        avg_spread = sum(spread_values) / len(spread_values) if spread_values else None
+        liquidity_quality = "unknown"
+        if avg_spread is not None:
+            liquidity_quality = "good" if avg_spread <= 5 else "fair" if avg_spread <= 15 else "poor"
+        pricing_quality = "usable" if profiles else "unknown"
+        if liquidity_quality == "poor":
+            pricing_quality = "degraded"
+        if df.is_empty():
+            pricing_quality = "unknown"
+        cheap_side = {"C": "calls", "P": "puts"}.get(pricing_summary.get("cheap_side"), "unknown")
+        costly_side = {"C": "calls", "P": "puts"}.get(pricing_summary.get("costly_side"), "unknown")
+        if cheap_side == "unknown" and costly_side == "unknown" and stats["total_p"] > 0:
+            cheap_side = "balanced"
+            costly_side = "balanced"
+        late = self.late_window_impacts.get(window_eval_key(session_date, symbol, slot["entry_label"])) or {}
+        return {
+            "symbol": symbol,
+            "window_id": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "is_partial": False,
+            "premium": {
+                "call_premium": round(float(stats["call_p"]), 2),
+                "put_premium": round(float(stats["put_p"]), 2),
+                "total_premium": round(float(stats["total_p"]), 2),
+                "net_premium_bias": "call_heavy" if stats["call_p"] > stats["put_p"] * 1.25 else "put_heavy" if stats["put_p"] > stats["call_p"] * 1.25 else "balanced",
+            },
+            "activity": {
+                "trade_count": int(df.height),
+                "contract_count": len(contexts),
+                "sweep_count": int(df.select(pl.col("is_sweep").cast(pl.Boolean, strict=False).fill_null(False).sum()).item()) if "is_sweep" in df.columns and not df.is_empty() else 0,
+                "large_trade_count": int(df.filter(pl.col("premium").cast(pl.Float64, strict=False).fill_null(0) >= SWEEP_PREMIUM_USD).height) if "premium" in df.columns and not df.is_empty() else 0,
+            },
+            "most_traded_contracts": most_traded,
+            "cheapest_contracts": cheapest,
+            "costliest_contracts": costliest,
+            "cheap_side": cheap_side,
+            "costly_side": costly_side,
+            "liquidity_quality": liquidity_quality,
+            "pricing_quality": pricing_quality,
+            "late_event_impact": {
+                "late_event_count": int(late.get("late_event_count") or 0),
+                "late_total_premium": round(float(late.get("late_total_premium") or 0.0), 2),
+                "late_call_premium": round(float(late.get("late_call_premium") or 0.0), 2),
+                "late_put_premium": round(float(late.get("late_put_premium") or 0.0), 2),
+            },
+            "source": "sigmatiq_nexus",
+        }
+
     async def connect(self):
         if REDIS_CLUSTER:
             self.redis = self._connect_cluster(REDIS_URL)
         else:
             self.redis = await redis.from_url(self._redis_url(REDIS_URL), decode_responses=False)
         self._log("redis_connected", cluster=REDIS_CLUSTER)
+        await self.restore_active_positions()
 
     def _connect_cluster(self, value: str):
         if value.startswith("redis://") or value.startswith("rediss://"):
-            return RedisCluster.from_url(value, decode_responses=False, ssl_cert_reqs=None)
+            return RedisCluster.from_url(value, decode_responses=False)
         if ",password=" in value:
             host, rest = value.split(",", 1)
             password = rest.split("password=", 1)[1].split(",", 1)[0]
             hostname, port = host.rsplit(":", 1)
-            return RedisCluster(host=hostname, port=int(port), password=password, ssl=True, ssl_cert_reqs=None, decode_responses=False)
+            return RedisCluster(host=hostname, port=int(port), password=password, ssl=True, decode_responses=False)
         parsed = urlparse(value)
-        return RedisCluster(host=parsed.hostname, port=parsed.port or 6379, password=parsed.password, ssl=parsed.scheme == "rediss", ssl_cert_reqs=None, decode_responses=False)
+        return RedisCluster(host=parsed.hostname, port=parsed.port or 6379, password=parsed.password, ssl=parsed.scheme == "rediss", decode_responses=False)
 
     def _redis_url(self, value: str) -> str:
         if value.startswith("redis://") or value.startswith("rediss://"):
@@ -949,6 +1164,7 @@ class SigmatiqNexus:
         if not self.redis:
             await self.connect()
         streams = input_streams()
+        await self.restore_stream_offsets(streams)
         self._log(
             "worker_started",
             symbols=sorted(SYMBOLS),
@@ -965,10 +1181,12 @@ class SigmatiqNexus:
                         message_count=sum(len(messages) for _, messages in replies),
                     )
                 for stream, messages in replies:
-                    stream_name = stream.decode("utf-8") if isinstance(stream, bytes) else stream
-                    for msg_id, data in messages:
-                        streams[stream_name] = msg_id
-                        await self.process_message(data)
+                        stream_name = stream.decode("utf-8") if isinstance(stream, bytes) else stream
+                        for msg_id, data in messages:
+                            streams[stream_name] = msg_id
+                            await self.process_message(data)
+                            await self.persist_stream_offset(stream_name, msg_id)
+                await self.evaluate_due_windows(datetime.now(timezone.utc))
             except Exception as e:
                 self._log("main_loop_error", error=str(e))
                 await asyncio.sleep(1)
@@ -981,7 +1199,77 @@ class SigmatiqNexus:
             self.feature_blocks_reported.clear()
             self.window_views_reported.clear()
             self.window_pricing_reported.clear()
+            self.option_market_context_reported.clear()
+            self.evaluated_windows.clear()
+            self.late_window_impacts.clear()
             self.last_reset_session_date = current_session_date
+
+    async def restore_stream_offsets(self, streams: dict[str, str]) -> None:
+        restored = 0
+        for stream_name in list(streams):
+            raw = await self.redis.get(redis_stream_offset_key(stream_name))
+            if not raw:
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            streams[stream_name] = str(raw)
+            restored += 1
+        if restored:
+            self._log("stream_offsets_restored", count=restored, streams=streams)
+
+    async def persist_stream_offset(self, stream_name: str, msg_id) -> None:
+        if isinstance(msg_id, bytes):
+            msg_id = msg_id.decode("utf-8")
+        await self.redis.set(redis_stream_offset_key(stream_name), str(msg_id))
+
+    async def restore_active_positions(self, session_date=None):
+        session_date = session_date or self.last_reset_session_date
+        restored = 0
+        for symbol in sorted(SYMBOLS):
+            raw = await self.redis.get(redis_active_position_key(session_date, symbol))
+            if not raw:
+                continue
+            try:
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                position = json.loads(raw)
+            except Exception as exc:
+                self._log("active_position_restore_failed", symbol=symbol, session_date=str(session_date), error=str(exc))
+                continue
+            self.active_positions[symbol] = position
+            restored += 1
+        if restored:
+            self._log("active_positions_restored", session_date=str(session_date), count=restored)
+
+    async def _acquire_final_locks(self, session_date, symbol: str, strategy: str, signal_id: str) -> bool:
+        lock_specs = [(redis_symbol_lock_key(session_date, symbol), symbol_lane_key(session_date, symbol))]
+        if FIRST_TRIGGER_SCOPE == "strategy":
+            lock_specs.append((redis_strategy_lock_key(session_date, symbol, strategy), signal_key(session_date, symbol, strategy)))
+        if strategy in GROUP_LOCK_STRATEGIES:
+            lock_specs.append((redis_group_lock_key(session_date, strategy), group_lock_key(session_date, strategy)))
+
+        acquired: list[tuple[str, str]] = []
+        for redis_key, memory_key in lock_specs:
+            locked = await self.redis.set(redis_key, signal_id, nx=True, ex=LOCK_TTL_SECONDS)
+            if not locked:
+                for acquired_key, _ in acquired:
+                    await self.redis.delete(acquired_key)
+                self._log("strategy_final_blocked_by_lock", strategy=strategy, symbol=symbol, session_date=str(session_date), lock_key=redis_key)
+                return False
+            acquired.append((redis_key, memory_key))
+        for _, memory_key in acquired:
+            self.signaled_today.add(memory_key)
+        return True
+
+    async def _persist_active_position(self, session_date, symbol: str, position: dict):
+        await self.redis.set(
+            redis_active_position_key(session_date, symbol),
+            json.dumps(position),
+            ex=ACTIVE_POSITION_TTL_SECONDS,
+        )
+
+    async def _clear_active_position(self, session_date, symbol: str):
+        await self.redis.delete(redis_active_position_key(session_date, symbol))
 
     async def process_message(self, data):
         try:
@@ -1017,19 +1305,114 @@ class SigmatiqNexus:
                 self.buffers[symbol] = deque(maxlen=self.max_buffer)
             self.buffers[symbol].append(payload)
 
-            slot = decision_slot(event_dt_utc)
-            if slot:
-                self._log(
-                    "slot_candidate_received",
-                    symbol=symbol,
-                    raw_symbol=payload.get("raw_symbol"),
-                    event_ts=payload.get("ts_utc"),
-                    buffer_size=len(self.buffers[symbol]),
-                    entry_time=slot["entry_label"],
-                )
-                await self.evaluate_strategy(symbol, slot, event_dt_utc)
+            await self._record_late_window_event(symbol, payload, event_dt_utc)
+            await self.evaluate_due_windows(event_dt_utc)
         except Exception as e:
             self._log("process_message_failed", error=str(e))
+
+    async def _record_late_window_event(self, symbol: str, payload: dict, event_dt_utc: datetime) -> None:
+        if not hasattr(self, "late_window_impacts"):
+            self.late_window_impacts = {}
+        slot = event_window_slot(event_dt_utc)
+        if not slot:
+            return
+        session_date = ny_session_date(event_dt_utc)
+        eval_key = window_eval_key(session_date, symbol, slot["entry_label"])
+        if eval_key not in self.evaluated_windows:
+            return
+
+        premium = _payload_float(payload, "premium") or 0.0
+        side = str(payload.get("side") or _option_side_from_raw_symbol(payload.get("raw_symbol")) or "").upper()
+        impact = self.late_window_impacts.setdefault(
+            eval_key,
+            {
+                "session_date": str(session_date),
+                "symbol": symbol,
+                "entry_time": slot["entry_label"],
+                "window_start": slot["window_start"].isoformat(),
+                "window_end": slot["window_end"].isoformat(),
+                "late_event_count": 0,
+                "late_total_premium": 0.0,
+                "late_call_premium": 0.0,
+                "late_put_premium": 0.0,
+                "last_event_ts": None,
+                "last_raw_symbol": None,
+            },
+        )
+        impact["late_event_count"] += 1
+        impact["late_total_premium"] += premium
+        if side == "C":
+            impact["late_call_premium"] += premium
+        elif side == "P":
+            impact["late_put_premium"] += premium
+        impact["last_event_ts"] = event_dt_utc.isoformat()
+        impact["last_raw_symbol"] = payload.get("raw_symbol")
+
+        msg = {
+            "message_id": new_message_id(),
+            "decision": "WINDOW_LATE_EVENT",
+            "symbol": symbol,
+            "session_date": str(session_date),
+            "entry_time": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "event_ts": event_dt_utc.isoformat(),
+            "raw_symbol": payload.get("raw_symbol"),
+            "side": side or None,
+            "premium": premium,
+            "late_event_count": impact["late_event_count"],
+            "late_total_premium": round(float(impact["late_total_premium"]), 2),
+            "late_call_premium": round(float(impact["late_call_premium"]), 2),
+            "late_put_premium": round(float(impact["late_put_premium"]), 2),
+            "source": "sigmatiq_nexus",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        redis_key = f"nexus_window_late_event:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg))
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self.redis.publish("signal:window_late_event", json.dumps(msg))
+        self._log(
+            "window_late_event_detected",
+            symbol=symbol,
+            session_date=str(session_date),
+            entry_time=slot["entry_label"],
+            raw_symbol=payload.get("raw_symbol"),
+            side=side or None,
+            premium=round(float(premium), 2),
+            late_event_count=impact["late_event_count"],
+            late_total_premium=round(float(impact["late_total_premium"]), 2),
+        )
+
+    def _slot_due(self, reference_dt_utc: datetime, slot: dict) -> bool:
+        reference_ny = reference_dt_utc.astimezone(NY)
+        due_ny = datetime.combine(reference_ny.date(), slot["entry"], tzinfo=NY) + timedelta(seconds=WINDOW_EVALUATION_GRACE_SECONDS)
+        return reference_ny >= due_ny
+
+    async def evaluate_due_windows(self, reference_dt_utc: datetime) -> None:
+        session_date = ny_session_date(reference_dt_utc)
+        for symbol in sorted(self.buffers):
+            if symbol not in SYMBOLS:
+                continue
+            for slot in MARKET_CONTEXT_WINDOWS:
+                if not self._slot_due(reference_dt_utc, slot):
+                    continue
+                await self.publish_option_market_context_for_slot(symbol, slot, session_date)
+            for slot in DECISION_SLOTS:
+                if not self._slot_due(reference_dt_utc, slot):
+                    continue
+                key = window_eval_key(session_date, symbol, slot["entry_label"])
+                if key in self.evaluated_windows:
+                    continue
+                self.evaluated_windows.add(key)
+                self._log(
+                    "window_due_for_evaluation",
+                    symbol=symbol,
+                    session_date=str(session_date),
+                    entry_time=slot["entry_label"],
+                    grace_seconds=WINDOW_EVALUATION_GRACE_SECONDS,
+                    buffer_size=len(self.buffers.get(symbol, [])),
+                )
+                await self.evaluate_strategy(symbol, slot, reference_dt_utc)
 
     async def _publish_liquidate(self, symbol, reason, ret, quote: dict | None = None):
         active_position = self.active_positions.get(symbol, {})
@@ -1058,6 +1441,8 @@ class SigmatiqNexus:
         }
         if symbol in self.active_positions:
             del self.active_positions[symbol]
+        position_session_date = active_position.get("session_date") or ny_session_date(datetime.now(timezone.utc))
+        await self._clear_active_position(position_session_date, symbol)
         await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
         await self._append_persistence_event(symbol, msg)
         await self.redis.publish("nexus_live_overlay:updates", symbol)
@@ -1076,19 +1461,102 @@ class SigmatiqNexus:
         }
 
     async def _contract_quote_snapshot(self, symbol: str, raw_symbol: str | None) -> dict:
-        tracked_raw_symbol = normalize_raw_symbol(raw_symbol)
-        if not tracked_raw_symbol:
+        raw_symbol_variants = _raw_symbol_key_variants(raw_symbol)
+        if not raw_symbol_variants:
             return {}
-        state_key = CONTRACT_STATE_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=tracked_raw_symbol)
-        tradability_key = CONTRACT_TRADABILITY_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=tracked_raw_symbol)
-        contract_state, tradability = await asyncio.gather(
-            read_json_payload(self.redis, state_key),
-            read_json_payload(self.redis, tradability_key),
+        for tracked_raw_symbol in raw_symbol_variants:
+            state_key = CONTRACT_STATE_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=tracked_raw_symbol)
+            tradability_key = CONTRACT_TRADABILITY_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=tracked_raw_symbol)
+            contract_state, tradability = await asyncio.gather(
+                read_json_payload(self.redis, state_key),
+                read_json_payload(self.redis, tradability_key),
+            )
+            if not contract_state and not tradability:
+                continue
+            exact_payload = {"symbol": symbol, "raw_symbol": tracked_raw_symbol}
+            _merge_contract_payload(exact_payload, contract_state)
+            _merge_contract_payload(exact_payload, tradability)
+            return self._quote_from_payload(symbol, tracked_raw_symbol, exact_payload)
+        return {}
+
+    def _quote_is_available(self, quote: dict) -> bool:
+        execution = _quote_execution_snapshot(quote, datetime.now(timezone.utc))
+        return execution["quote_freshness"] in FRESH_STATUSES and execution["reference_price"] is not None
+
+    async def _spread_candidate(self, df: pl.DataFrame, symbol: str, right: str) -> dict | None:
+        if df.is_empty() or not {"raw_symbol", "side", "delta"}.issubset(set(df.columns)):
+            return None
+        side_df = df.filter(pl.col("side").cast(pl.Utf8).str.to_uppercase() == right)
+        if side_df.is_empty():
+            return None
+        candidates = []
+        for row in side_df.to_dicts():
+            raw_symbol = str(row.get("raw_symbol") or "").replace(" ", "").upper()
+            details = _contract_details_from_raw_symbol(raw_symbol)
+            if details["strike"] is None or details["side"] != right:
+                continue
+            try:
+                delta_distance = abs(abs(float(row.get("delta") or 0.0)) - SPREAD_TARGET_DELTA)
+                premium = float(row.get("premium") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            candidates.append((delta_distance, -premium, raw_symbol, details))
+        if not candidates:
+            return None
+        _, _, short_raw_symbol, short_details = sorted(candidates)[0]
+        short_strike = float(short_details["strike"])
+        long_strike = short_strike + SPREAD_STRIKE_WIDTH if right == "C" else short_strike - SPREAD_STRIKE_WIDTH
+        long_raw_symbol = _raw_symbol_with_strike(short_raw_symbol, long_strike)
+        if not long_raw_symbol:
+            return None
+        short_quote, long_quote = await asyncio.gather(
+            self._contract_quote_snapshot(symbol, short_raw_symbol),
+            self._contract_quote_snapshot(symbol, long_raw_symbol),
         )
-        exact_payload = {"symbol": symbol, "raw_symbol": tracked_raw_symbol}
-        _merge_contract_payload(exact_payload, contract_state)
-        _merge_contract_payload(exact_payload, tradability)
-        return self._quote_from_payload(symbol, tracked_raw_symbol, exact_payload)
+        if not self._quote_is_available(short_quote) or not self._quote_is_available(long_quote):
+            return None
+        short_bid = short_quote.get("option_bid")
+        long_ask = long_quote.get("option_ask")
+        if short_bid is None or long_ask is None:
+            return None
+        net_credit = float(short_bid) - float(long_ask)
+        if net_credit < SPREAD_MIN_ENTRY_CREDIT:
+            return None
+        max_loss = max(SPREAD_STRIKE_WIDTH - net_credit, 0.0)
+        return {
+            "structure": "credit_spread",
+            "spread_type": "put_credit" if right == "P" else "call_credit",
+            "right": right,
+            "short_raw_symbol": short_raw_symbol,
+            "long_raw_symbol": long_raw_symbol,
+            "short_strike": short_strike,
+            "long_strike": long_strike,
+            "expiry_date": short_details["expiry_date"],
+            "net_credit": round(net_credit, 4),
+            "strike_width": SPREAD_STRIKE_WIDTH,
+            "max_loss": round(max_loss, 4),
+            "max_loss_assumption": "AT_EXPIRATION_NO_ASSIGNMENT",
+            "legs": [
+                {
+                    "raw_symbol": short_raw_symbol,
+                    "action": "SELL",
+                    "ratio": -1,
+                    "side": right,
+                    "strike": short_strike,
+                    "expiry_date": short_details["expiry_date"],
+                    "quote": short_quote,
+                },
+                {
+                    "raw_symbol": long_raw_symbol,
+                    "action": "BUY",
+                    "ratio": 1,
+                    "side": right,
+                    "strike": long_strike,
+                    "expiry_date": short_details["expiry_date"],
+                    "quote": long_quote,
+                },
+            ],
+        }
 
     async def _active_position_quote(self, symbol: str, position: dict, payload: dict) -> dict:
         tracked_raw_symbol = normalize_raw_symbol(position.get("raw_symbol"))
@@ -1137,6 +1605,10 @@ class SigmatiqNexus:
         # Deterministic order follows the research log: confluence first, then
         # the specialist assigned to the completed window. First trigger wins.
         await self.evaluate_confluence_sniper(slot_df, symbol, slot, session_date)
+        if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "10:00":
+            await self.evaluate_put_credit_open30_spread(slot_df, symbol, slot, session_date)
+        if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "10:00":
+            await self.evaluate_call_credit_open30_spread(slot_df, symbol, slot, session_date)
         if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "10:00":
             await self.evaluate_open_specialist(slot_df, symbol, slot, session_date)
         if not self.already_signaled(session_date, symbol, "*"):
@@ -1401,6 +1873,34 @@ class SigmatiqNexus:
         await self.redis.publish("signal:window_pricing", json.dumps(msg))
         self._log("window_pricing_published", symbol=symbol, session_date=str(session_date), entry_time=slot["entry_label"], evaluated_contract_count=summary["evaluated_contract_count"])
 
+    async def publish_option_market_context_for_slot(self, symbol: str, slot: dict, session_date) -> None:
+        key = (str(session_date), symbol, slot["entry_label"])
+        reported = getattr(self, "option_market_context_reported", set())
+        if key in reported:
+            return
+        if symbol not in self.buffers:
+            return
+        df = window_df_for_slot(pl.DataFrame(list(self.buffers[symbol])), slot)
+        if df.is_empty():
+            return
+        reported.add(key)
+        self.option_market_context_reported = reported
+        msg = self._option_market_context_payload(df, symbol, slot, session_date)
+        redis_key = f"nexus_option_market_context:{symbol}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg))
+        await self.redis.set(f"nexus_option_market_context:{symbol}:latest", json.dumps(msg))
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self.redis.publish("signal:option_market_context", json.dumps(msg))
+        self._log(
+            "option_market_context_published",
+            symbol=symbol,
+            session_date=str(session_date),
+            window_id=slot["entry_label"],
+            trade_count=msg["activity"]["trade_count"],
+            contract_count=msg["activity"]["contract_count"],
+            pricing_quality=msg["pricing_quality"],
+        )
+
     async def publish_window_assessments(self, df: pl.DataFrame, symbol: str, slot: dict, session_date) -> None:
         self._current_window_df = df
         strategies = [
@@ -1409,6 +1909,8 @@ class SigmatiqNexus:
             ("etf_low_sweep_core", self.assess_low_sweep_window),
             ("etf_flow_specialist", self.assess_flow_window),
             ("etf_momentum_specialist", self.assess_momentum_window),
+            ("etf_put_credit_open30_spread", self.assess_put_credit_open30_spread),
+            ("etf_call_credit_open30_spread", self.assess_call_credit_open30_spread),
         ]
         for strategy, assessor in strategies:
             failures = await self._strategy_feature_failures(strategy, symbol, df)
@@ -1459,6 +1961,74 @@ class SigmatiqNexus:
         if pricing_lag is None or pricing_lag > -0.05:
             return "CHOP", "pricing_lag_not_cheap_enough"
         return sentiment, "confluence_alignment"
+
+    async def evaluate_put_credit_open30_spread(self, df, symbol, slot: dict, session_date):
+        strategy = "etf_put_credit_open30_spread"
+        if self.already_signaled(session_date, symbol, strategy) or slot["entry_label"] != "10:00" or symbol not in {"SPY", "QQQ"}:
+            return
+        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
+            return
+        sentiment, valid = await self.check_put_credit_open30_spread(df, symbol, slot)
+        if not valid:
+            self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="put_credit_open30_heuristic_not_met", **self._window_log_fields(df, slot))
+            return
+        candidate = await self._spread_candidate(df, symbol, "P")
+        if not candidate:
+            self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="no_valid_put_credit_spread_candidate", **self._window_log_fields(df, slot))
+            return
+        await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date, candidate["short_raw_symbol"])
+        await self._publish_spread_final(strategy, symbol, sentiment, 1.0, session_date, slot, candidate)
+
+    async def check_put_credit_open30_spread(self, df, symbol, slot: dict):
+        if slot["entry_label"] != "10:00" or symbol not in {"SPY", "QQQ"}:
+            return None, False
+        stats = window_stats(df)
+        if stats["total_p"] < MIN_WINDOW_PREMIUM:
+            return None, False
+        iv_rank, _, _ = await self.get_context(symbol)
+        if iv_rank >= SPREAD_MAX_IV_RANK:
+            return None, False
+        if stats["call_p"] < stats["put_p"] * OPEN_CALL_DOMINANCE:
+            return None, False
+        return "BULLISH", True
+
+    async def assess_put_credit_open30_spread(self, df, symbol, slot: dict):
+        sentiment, valid = await self.check_put_credit_open30_spread(df, symbol, slot)
+        return (sentiment, "open30_call_dominance_put_credit_context") if valid else ("CHOP", "put_credit_open30_filter_not_met")
+
+    async def evaluate_call_credit_open30_spread(self, df, symbol, slot: dict, session_date):
+        strategy = "etf_call_credit_open30_spread"
+        if self.already_signaled(session_date, symbol, strategy) or slot["entry_label"] != "10:00" or symbol != "SPY":
+            return
+        if not await self._strategy_features_ready(strategy, symbol, df, slot, session_date):
+            return
+        sentiment, valid = await self.check_call_credit_open30_spread(df, symbol, slot)
+        if not valid:
+            self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="call_credit_open30_heuristic_not_met", **self._window_log_fields(df, slot))
+            return
+        candidate = await self._spread_candidate(df, symbol, "C")
+        if not candidate:
+            self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="no_valid_call_credit_spread_candidate", **self._window_log_fields(df, slot))
+            return
+        await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date, candidate["short_raw_symbol"])
+        await self._publish_spread_final(strategy, symbol, sentiment, 1.0, session_date, slot, candidate)
+
+    async def check_call_credit_open30_spread(self, df, symbol, slot: dict):
+        if slot["entry_label"] != "10:00" or symbol != "SPY":
+            return None, False
+        stats = window_stats(df)
+        if stats["total_p"] < MIN_WINDOW_PREMIUM:
+            return None, False
+        iv_rank, _, _ = await self.get_context(symbol)
+        if iv_rank >= SPREAD_MAX_IV_RANK:
+            return None, False
+        if stats["put_p"] < stats["call_p"] * OPEN_CALL_DOMINANCE:
+            return None, False
+        return "BEARISH", True
+
+    async def assess_call_credit_open30_spread(self, df, symbol, slot: dict):
+        sentiment, valid = await self.check_call_credit_open30_spread(df, symbol, slot)
+        return (sentiment, "open30_put_dominance_call_credit_context") if valid else ("CHOP", "call_credit_open30_filter_not_met")
 
     def calculate_pricing_lag(self, df, sentiment: str) -> float | None:
         required = {"ts_utc", "raw_symbol", "underlying_mid", "delta"}
@@ -1749,6 +2319,20 @@ class SigmatiqNexus:
         signal_id = build_signal_id(strategy, symbol, session_date, slot, raw_symbol)
         quote = await self._contract_quote_snapshot(symbol, raw_symbol) if raw_symbol else {}
         execution = _quote_execution_snapshot(quote, datetime.now(timezone.utc))
+        if execution["quote_freshness"] not in FRESH_STATUSES or execution["reference_price"] is None:
+            self._log(
+                "strategy_final_blocked_by_quote",
+                strategy=strategy,
+                symbol=symbol,
+                raw_symbol=raw_symbol,
+                quote_freshness=execution["quote_freshness"],
+                entry_time=slot["entry_label"] if slot else None,
+            )
+            return
+        entry_price = execution["reference_price"]
+        key_date = session_date or ny_session_date(datetime.now(timezone.utc))
+        if not await self._acquire_final_locks(key_date, symbol, strategy, signal_id):
+            return
         msg = {
             "message_id": new_message_id(),
             "signal_id": signal_id,
@@ -1791,32 +2375,137 @@ class SigmatiqNexus:
                 "strike": _contract_details_from_raw_symbol(raw_symbol)["strike"],
                 "option_side": _contract_details_from_raw_symbol(raw_symbol)["side"],
             }.items() if v is not None})
-        key_date = session_date or ny_session_date(datetime.now(timezone.utc))
-        self.signaled_today.add(symbol_lane_key(key_date, symbol))
-        if FIRST_TRIGGER_SCOPE == "strategy":
-            self.signaled_today.add(signal_key(key_date, symbol, strategy))
-        if strategy in GROUP_LOCK_STRATEGIES:
-            self.signaled_today.add(group_lock_key(key_date, strategy))
-        
         # Track position for dynamic exit
         active_positions = getattr(self, "active_positions", None)
         if active_positions is None:
             active_positions = {}
             self.active_positions = active_positions
         if entry_price > 0:
-            active_positions[symbol] = {
+            position = {
                 'entry_price': entry_price,
                 'is_guarded': False,
                 'side': sentiment,
                 'raw_symbol': raw_symbol,
                 'signal_id': signal_id,
                 'position_id': signal_id,
+                'session_date': str(key_date),
             }
+            active_positions[symbol] = position
+            await self._persist_active_position(key_date, symbol, position)
 
         await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
         await self._append_persistence_event(symbol, msg)
         await self.redis.publish("nexus_live_overlay:updates", symbol)
         self._log("strategy_final_published", strategy=strategy, symbol=symbol, sentiment=sentiment, confidence=round(float(confidence), 4), entry_price=round(float(entry_price), 4), session_date=str(key_date), entry_time=slot["entry_label"] if slot else None)
+
+    async def _publish_spread_final(self, strategy: str, symbol: str, sentiment: str, confidence: float, session_date, slot: dict, candidate: dict):
+        raw_symbol = candidate["short_raw_symbol"]
+        signal_id = build_signal_id(strategy, symbol, session_date, slot, raw_symbol)
+        leg_quotes = [leg.get("quote") or {} for leg in candidate["legs"]]
+        executions = [_quote_execution_snapshot(quote, datetime.now(timezone.utc)) for quote in leg_quotes]
+        quote_freshness = (
+            "available"
+            if executions and all(execution["quote_freshness"] in FRESH_STATUSES for execution in executions)
+            else "stale"
+        )
+        quote_valid_until = min(
+            [execution["quote_valid_until"] for execution in executions if execution.get("quote_valid_until")],
+            default=None,
+        )
+        legs = []
+        for leg in candidate["legs"]:
+            quote = leg.get("quote") or {}
+            legs.append({
+                "raw_symbol": leg["raw_symbol"],
+                "action": leg["action"],
+                "ratio": leg["ratio"],
+                "side": leg["side"],
+                "strike": leg["strike"],
+                "expiry_date": leg["expiry_date"],
+                "quote": {
+                    "option_mid": quote.get("option_mid"),
+                    "option_bid": quote.get("option_bid"),
+                    "option_ask": quote.get("option_ask"),
+                    "quote_ts": quote.get("quote_ts"),
+                    "quote_age_ms": quote.get("quote_age_ms"),
+                    "tradability_bucket": quote.get("tradability_bucket"),
+                },
+            })
+        msg = {
+            "message_id": new_message_id(),
+            "signal_id": signal_id,
+            "position_id": signal_id,
+            "strategy": strategy,
+            "symbol": symbol,
+            "stage": 2,
+            "decision": "BET",
+            "sentiment": sentiment,
+            "confidence": float(confidence),
+            "instrument_type": "vertical_credit_spread",
+            "paper_only": True,
+            "entry_credit": candidate["net_credit"],
+            "entry_price": candidate["net_credit"],
+            "entry_price_reference": "net_credit",
+            "quote_freshness": quote_freshness,
+            "quote_valid_until": quote_valid_until,
+            "spread": {
+                "structure": candidate["structure"],
+                "spread_type": candidate["spread_type"],
+                "strike_width": candidate["strike_width"],
+                "short_raw_symbol": candidate["short_raw_symbol"],
+                "long_raw_symbol": candidate["long_raw_symbol"],
+                "short_strike": candidate["short_strike"],
+                "long_strike": candidate["long_strike"],
+                "expiry_date": candidate["expiry_date"],
+                "net_credit": candidate["net_credit"],
+                "max_loss": candidate["max_loss"],
+                "max_loss_assumption": candidate["max_loss_assumption"],
+                "take_profit_pct": SPREAD_TAKE_PROFIT_PCT,
+                "stop_loss_pct": SPREAD_STOP_LOSS_PCT,
+                "hold_seconds": SPREAD_HOLD_SECONDS,
+                "min_entry_credit": SPREAD_MIN_ENTRY_CREDIT,
+                "target_delta": SPREAD_TARGET_DELTA,
+            },
+            "legs": legs,
+            "execution": {
+                "order_type": "limit",
+                "price_reference": "net_credit",
+                "reference_price": candidate["net_credit"],
+                "max_slippage_pct": EXECUTION_MAX_SLIPPAGE_PCT,
+                "quote_freshness": quote_freshness,
+                "quote_valid_until": quote_valid_until,
+                "fill_realism": "REALISTIC",
+                "paper_only": True,
+            },
+            "risk": {
+                "take_profit_pct": SPREAD_TAKE_PROFIT_PCT,
+                "stop_loss_pct": SPREAD_STOP_LOSS_PCT,
+                "max_hold_seconds": SPREAD_HOLD_SECONDS,
+                "max_loss": candidate["max_loss"],
+                "policy": "vertical_credit_spread_paper_only",
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_date": str(session_date),
+            "entry_time": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "source": "sigmatiq_nexus",
+        }
+        redis_key = f"nexus_spread_overlay:{symbol}:{strategy}:{slot['entry_label']}"
+        await self.redis.set(redis_key, json.dumps(msg))
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self.redis.publish("nexus_spread_overlay:updates", symbol)
+        await self.redis.publish(f"signal:spread:{strategy}", json.dumps(msg))
+        self._log(
+            "strategy_spread_final_published",
+            strategy=strategy,
+            symbol=symbol,
+            sentiment=sentiment,
+            confidence=round(float(confidence), 4),
+            entry_credit=round(float(candidate["net_credit"]), 4),
+            session_date=str(session_date),
+            entry_time=slot["entry_label"],
+        )
 
     async def _append_persistence_event(self, symbol, msg):
         await self._append_persistence_event_for_key(f"nexus_live_overlay:{symbol}", msg)

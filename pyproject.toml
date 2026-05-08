@@ -12,6 +12,11 @@ dependencies = [
     "msgpack>=1.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 nexus = "sigmatiq_nexus.nexus_worker:main"
 nexus-audit-features = "sigmatiq_nexus.feature_audit:main"
