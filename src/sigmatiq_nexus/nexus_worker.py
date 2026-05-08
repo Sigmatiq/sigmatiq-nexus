@@ -58,6 +58,9 @@ GEX_CONTEXT_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_GEX_CONTEXT_MAX_AGE_SECO
 UNDERLYING_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_UNDERLYING_MAX_AGE_SECONDS", "5"))
 OPTION_QUOTE_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_OPTION_QUOTE_MAX_AGE_SECONDS", "5"))
 GREEK_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_GREEK_MAX_AGE_SECONDS", "60"))
+PRICING_LAG_MIN_BASELINE_SECONDS = int(os.environ.get("NEXUS_PRICING_LAG_MIN_BASELINE_SECONDS", "300"))
+PRICING_LAG_MIN_PRICE_MOVE = float(os.environ.get("NEXUS_PRICING_LAG_MIN_PRICE_MOVE", "0.005"))
+PRICING_LAG_MIN_UNDERLYING_MOVE = float(os.environ.get("NEXUS_PRICING_LAG_MIN_UNDERLYING_MOVE", "0.005"))
 AGGRESSOR_EDGE_PCT = float(os.environ.get("NEXUS_AGGRESSOR_EDGE_PCT", "0.20"))
 AGGRESSOR_MAX_SPREAD_PCT = float(os.environ.get("NEXUS_AGGRESSOR_MAX_SPREAD_PCT", "0.25"))
 SWEEP_PREMIUM_USD = float(os.environ.get("NEXUS_SWEEP_PREMIUM_USD", "25000"))
@@ -1033,25 +1036,43 @@ class SigmatiqNexus:
         for raw_symbol in df.select("raw_symbol").drop_nulls().unique()["raw_symbol"].to_list():
             hist = (
                 df.filter(pl.col("raw_symbol") == raw_symbol)
-                .with_columns(pl.col("ts_utc").str.to_datetime(strict=False, time_zone="UTC").alias("_dt_utc"))
                 .sort("_dt_utc")
+                if "_dt_utc" in df.columns
+                else df.filter(pl.col("raw_symbol") == raw_symbol).sort("ts_utc")
             )
-            if hist.height < 2:
+            valid_rows = []
+            for row in hist.to_dicts():
+                event_ts = parse_optional_datetime(row.get("ts_utc"))
+                quote_ts = parse_optional_datetime(row.get("quote_ts_utc"))
+                if event_ts is None or quote_ts is None:
+                    continue
+                if abs((quote_ts - event_ts).total_seconds()) > OPTION_QUOTE_MAX_AGE_SECONDS:
+                    continue
+                try:
+                    p = float(row.get(price_col) or 0.0)
+                    s = float(row.get("underlying_mid") or 0.0)
+                    delta = float(row.get("delta") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if p <= 0 or s <= 0:
+                    continue
+                valid_rows.append((event_ts, row, p, s, delta))
+            valid_rows.sort(key=lambda item: item[0])
+            if len(valid_rows) < 2:
                 continue
-            end = hist.tail(1)
-            end_ts = end[0, "_dt_utc"]
-            start = hist.filter(pl.col("_dt_utc") <= end_ts - timedelta(minutes=5)).tail(1)
-            if start.is_empty():
-                start = hist.head(1)
-            p_start = float(start[0, price_col] or 0.0)
-            p_now = float(end[0, price_col] or 0.0)
-            s_start = float(start[0, "underlying_mid"] or 0.0)
-            s_now = float(end[0, "underlying_mid"] or 0.0)
-            delta = float(start[0, "delta"] or 0.0)
-            if p_start <= 0:
+            end_ts, end_row, p_now, s_now, _ = valid_rows[-1]
+            start_candidates = [
+                item
+                for item in valid_rows
+                if (end_ts - item[0]).total_seconds() >= PRICING_LAG_MIN_BASELINE_SECONDS
+            ]
+            if not start_candidates:
                 continue
+            start_ts, _, p_start, s_start, delta = start_candidates[-1]
             actual_change = p_now - p_start
             expected_change = delta * (s_now - s_start)
+            if abs(actual_change) < PRICING_LAG_MIN_PRICE_MOVE and abs(s_now - s_start) < PRICING_LAG_MIN_UNDERLYING_MOVE:
+                continue
             pricing_lag = (actual_change - expected_change) / (p_start + 1e-9)
             details = _contract_details_from_raw_symbol(raw_symbol)
             premium = hist.select(pl.col("premium").cast(pl.Float64, strict=False).fill_null(0).sum()).item() if "premium" in hist.columns else 0.0
@@ -1061,9 +1082,10 @@ class SigmatiqNexus:
                 "pricing_lag": round(float(pricing_lag), 6),
                 "cheapness_score": round(float(cheapness_score), 2),
                 "premium": float(premium),
-                "side": str(end[0, "side"] or details["side"] or ""),
+                "side": str(end_row.get("side") or details["side"] or ""),
                 "expiry_date": details["expiry_date"],
                 "strike": details["strike"],
+                "baseline_seconds": int((end_ts - start_ts).total_seconds()),
             })
         return profiles
 
@@ -1079,6 +1101,8 @@ class SigmatiqNexus:
                 "cheap_side_avg_pricing_lag": None,
                 "costly_side": None,
                 "costly_side_avg_pricing_lag": None,
+                "pricing_quality": "unknown",
+                "pricing_quality_reason": "no_reliable_pricing_profiles",
             }
         cheapest = min(profiles, key=lambda p: p["pricing_lag"])
         costliest = max(profiles, key=lambda p: p["pricing_lag"])
@@ -1098,6 +1122,18 @@ class SigmatiqNexus:
         }
         cheap_side = min(side_avgs, key=side_avgs.get) if side_avgs else None
         costly_side = max(side_avgs, key=side_avgs.get) if side_avgs else None
+        lag_values = [float(p["pricing_lag"]) for p in profiles]
+        lag_range = max(lag_values) - min(lag_values)
+        if lag_range < PRICING_LAG_MIN_PRICE_MOVE:
+            cheap_side = None
+            costly_side = None
+            cheapest = None
+            costliest = None
+            pricing_quality = "degraded"
+            pricing_quality_reason = "pricing_lag_range_too_small"
+        else:
+            pricing_quality = "usable"
+            pricing_quality_reason = "point_in_time_pricing_profiles"
         return {
             "profiles": profiles,
             "evaluated_contract_count": len(profiles),
@@ -1107,6 +1143,8 @@ class SigmatiqNexus:
             "cheap_side_avg_pricing_lag": round(float(side_avgs[cheap_side]), 6) if cheap_side else None,
             "costly_side": costly_side,
             "costly_side_avg_pricing_lag": round(float(side_avgs[costly_side]), 6) if costly_side else None,
+            "pricing_quality": pricing_quality,
+            "pricing_quality_reason": pricing_quality_reason,
         }
 
     def _contract_contexts(self, df: pl.DataFrame, profiles: list[dict]) -> list[dict]:
@@ -1165,7 +1203,7 @@ class SigmatiqNexus:
         liquidity_quality = "unknown"
         if avg_spread is not None:
             liquidity_quality = "good" if avg_spread <= 5 else "fair" if avg_spread <= 15 else "poor"
-        pricing_quality = "usable" if profiles else "unknown"
+        pricing_quality = pricing_summary.get("pricing_quality") or ("usable" if profiles else "unknown")
         if liquidity_quality == "poor":
             pricing_quality = "degraded"
         if df.is_empty():
@@ -1202,6 +1240,7 @@ class SigmatiqNexus:
             "costly_side": costly_side,
             "liquidity_quality": liquidity_quality,
             "pricing_quality": pricing_quality,
+            "pricing_quality_reason": pricing_summary.get("pricing_quality_reason"),
             "late_event_impact": {
                 "late_event_count": int(late.get("late_event_count") or 0),
                 "late_total_premium": round(float(late.get("late_total_premium") or 0.0), 2),
@@ -2174,6 +2213,8 @@ class SigmatiqNexus:
             "cheap_side_avg_pricing_lag": summary["cheap_side_avg_pricing_lag"],
             "costly_side": summary["costly_side"],
             "costly_side_avg_pricing_lag": summary["costly_side_avg_pricing_lag"],
+            "pricing_quality": summary["pricing_quality"],
+            "pricing_quality_reason": summary["pricing_quality_reason"],
             "source": "sigmatiq_nexus",
         }
         msg.update(narratives.build_window_pricing_narrative(msg))
@@ -2396,6 +2437,16 @@ class SigmatiqNexus:
         start = hist.filter(pl.col("_dt_utc") <= end_ts - timedelta(minutes=5)).tail(1)
         if start.is_empty():
             return None
+        event_start = parse_optional_datetime(start[0, "ts_utc"])
+        event_end = parse_optional_datetime(end[0, "ts_utc"])
+        quote_start = parse_optional_datetime(start[0, "quote_ts_utc"]) if "quote_ts_utc" in hist.columns else None
+        quote_end = parse_optional_datetime(end[0, "quote_ts_utc"]) if "quote_ts_utc" in hist.columns else None
+        if event_start is None or event_end is None or quote_start is None or quote_end is None:
+            return None
+        if abs((quote_start - event_start).total_seconds()) > OPTION_QUOTE_MAX_AGE_SECONDS:
+            return None
+        if abs((quote_end - event_end).total_seconds()) > OPTION_QUOTE_MAX_AGE_SECONDS:
+            return None
         p_start = float(start[0, price_col] or 0.0)
         p_now = float(end[0, price_col] or 0.0)
         s_start = float(start[0, "underlying_mid"] or 0.0)
@@ -2405,6 +2456,8 @@ class SigmatiqNexus:
             return None
         actual_change = p_now - p_start
         expected_change = delta * (s_now - s_start)
+        if abs(actual_change) < PRICING_LAG_MIN_PRICE_MOVE and abs(s_now - s_start) < PRICING_LAG_MIN_UNDERLYING_MOVE:
+            return None
         return (actual_change - expected_change) / (p_start + 1e-9)
 
     async def evaluate_open_specialist(self, df, symbol, slot: dict, session_date, reference_time: datetime | None = None):

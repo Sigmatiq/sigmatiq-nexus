@@ -406,6 +406,8 @@ Market-context windows run every 30 minutes from `09:30-16:00` ET, plus optional
 
 Payload includes premium totals, call/put premium bias, trade/contract counts, most-traded contracts, cheapest/costliest contracts, cheap/costly side, liquidity quality, pricing quality, and late-event impact.
 
+Cheap/costly contract and side reads are only emitted when Nexus has point-in-time quote evidence. A pricing profile requires option quote timestamps close to the trade event, a baseline at least `NEXUS_PRICING_LAG_MIN_BASELINE_SECONDS` old, and non-flat option or underlying movement. If those checks fail, `pricing_quality` is `unknown` or `degraded`, `pricing_quality_reason` explains why, and narratives must not say a side appears cheap.
+
 ## Published Nexus Messages
 
 - `INTERMEDIATE`
@@ -423,6 +425,7 @@ Payload includes premium totals, call/put premium bias, trade/contract counts, m
 - `WINDOW_PRICING`
   - Redis key: `nexus_window_pricing:{symbol}:{entry_label}`
   - Pub/Sub: `signal:window_pricing`
+  - Includes `pricing_quality` and `pricing_quality_reason`; cheap/costly fields are null when point-in-time pricing evidence is not reliable.
 - `WINDOW_LATE_EVENT`
   - Redis key: `nexus_window_late_event:{symbol}:{entry_label}`
   - Pub/Sub: `signal:window_late_event`

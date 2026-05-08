@@ -269,7 +269,9 @@ def build_option_market_context_narrative(payload: dict) -> dict:
     elif pricing_quality == "unknown":
         what_it_means.append("Pricing quality is unknown — insufficient data for a reliable read.")
 
-    if cheap_side not in ("unknown", "balanced") and cheapest:
+    reliable_pricing = pricing_quality == "usable" and cheap_side not in ("unknown", "balanced")
+
+    if reliable_pricing and cheapest:
         top_cheap = cheapest[0]
         lag = top_cheap.get("pricing_lag")
         if lag is not None:
@@ -295,11 +297,16 @@ def build_option_market_context_narrative(payload: dict) -> dict:
     if trade_count == 0:
         summary = "No trades in this completed window."
     elif bias == "call_heavy":
-        summary = f"Call premium dominated ({_fmt_premium(call_p)} vs {_fmt_premium(put_p)}), {cheap_side} side appears cheap."
+        summary = f"Call premium dominated ({_fmt_premium(call_p)} vs {_fmt_premium(put_p)})."
     elif bias == "put_heavy":
-        summary = f"Put premium dominated ({_fmt_premium(put_p)} vs {_fmt_premium(call_p)}), {cheap_side} side appears cheap."
+        summary = f"Put premium dominated ({_fmt_premium(put_p)} vs {_fmt_premium(call_p)})."
     else:
-        summary = f"Premium was balanced ({_fmt_premium(total_p)} total), {cheap_side} side appears cheap."
+        summary = f"Premium was balanced ({_fmt_premium(total_p)} total)."
+    if trade_count > 0:
+        if reliable_pricing:
+            summary += f" {cheap_side.capitalize()} side appears cheap."
+        elif pricing_quality in ("degraded", "unknown"):
+            summary += " Pricing cheap/costly read is unavailable."
 
     result = {
         "narrative_version": NARRATIVE_VERSION,

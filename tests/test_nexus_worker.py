@@ -304,6 +304,7 @@ def test_confluence_pricing_lag_detects_cheap_option_after_underlying_move():
             "option_mid": 1.00,
             "underlying_mid": 700.0,
             "delta": 0.50,
+            "quote_ts_utc": "2026-05-05T14:00:00Z",
         },
         {
             **row("2026-05-05T14:06:00Z", "C", 125_000),
@@ -311,6 +312,7 @@ def test_confluence_pricing_lag_detects_cheap_option_after_underlying_move():
             "option_mid": 1.10,
             "underlying_mid": 701.0,
             "delta": 0.50,
+            "quote_ts_utc": "2026-05-05T14:06:00Z",
         },
     ])
 
@@ -763,6 +765,7 @@ def test_publish_window_pricing_sets_key_and_side_summary():
             "gamma": 0.01,
             "underlying_mid": 720.0,
             "option_mid": 10.0,
+            "quote_ts_utc": "2026-05-05T13:35:00Z",
         }),
         nw.normalize_trade_payload({
             "symbol": "SPY",
@@ -778,6 +781,7 @@ def test_publish_window_pricing_sets_key_and_side_summary():
             "gamma": 0.01,
             "underlying_mid": 721.5,
             "option_mid": 10.4,
+            "quote_ts_utc": "2026-05-05T13:41:00Z",
         }),
         nw.normalize_trade_payload({
             "symbol": "SPY",
@@ -793,6 +797,7 @@ def test_publish_window_pricing_sets_key_and_side_summary():
             "gamma": 0.01,
             "underlying_mid": 720.0,
             "option_mid": 8.0,
+            "quote_ts_utc": "2026-05-05T13:35:00Z",
         }),
         nw.normalize_trade_payload({
             "symbol": "SPY",
@@ -808,6 +813,7 @@ def test_publish_window_pricing_sets_key_and_side_summary():
             "gamma": 0.01,
             "underlying_mid": 721.5,
             "option_mid": 7.4,
+            "quote_ts_utc": "2026-05-05T13:41:00Z",
         }),
     ])
 
@@ -820,7 +826,55 @@ def test_publish_window_pricing_sets_key_and_side_summary():
     assert payload["costly_contract_raw_symbol"] is not None
     assert payload["cheap_side"] in {"C", "P"}
     assert payload["costly_side"] in {"C", "P"}
+    assert payload["pricing_quality"] == "usable"
+    assert payload["pricing_quality_reason"] == "point_in_time_pricing_profiles"
     assert worker.redis.publishes[0][0] == "signal:window_pricing"
+
+
+def test_window_pricing_degrades_when_quotes_are_not_point_in_time():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    df = pl.DataFrame([
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00720000",
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "side": "C",
+            "price": 10.0,
+            "size": 200,
+            "premium": 200_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": 0.50,
+            "gamma": 0.01,
+            "underlying_mid": 720.0,
+            "option_mid": 10.0,
+            "quote_ts_utc": "2026-05-05T14:00:00Z",
+        }),
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00720000",
+            "ts_utc": "2026-05-05T13:41:00Z",
+            "side": "C",
+            "price": 10.0,
+            "size": 200,
+            "premium": 200_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": 0.50,
+            "gamma": 0.01,
+            "underlying_mid": 720.0,
+            "option_mid": 10.0,
+            "quote_ts_utc": "2026-05-05T14:00:00Z",
+        }),
+    ])
+
+    summary = worker._window_pricing_summary(df)
+
+    assert summary["evaluated_contract_count"] == 0
+    assert summary["cheap_contract"] is None
+    assert summary["cheap_side"] is None
+    assert summary["pricing_quality"] == "unknown"
+    assert summary["pricing_quality_reason"] == "no_reliable_pricing_profiles"
 
 
 def _contract_state(mid: float, bid: float, ask: float) -> str:
@@ -1563,6 +1617,7 @@ def test_publish_option_market_context_sets_latest_and_publishes():
             "option_mid": 10.0,
             "option_bid": 9.9,
             "option_ask": 10.1,
+            "quote_ts_utc": "2026-05-05T13:35:00Z",
         },
         {
             "ts_utc": "2026-05-05T13:42:00Z",
@@ -1576,6 +1631,7 @@ def test_publish_option_market_context_sets_latest_and_publishes():
             "option_mid": 10.7,
             "option_bid": 10.6,
             "option_ask": 10.8,
+            "quote_ts_utc": "2026-05-05T13:42:00Z",
         },
         {
             "ts_utc": "2026-05-05T13:50:00Z",
@@ -1604,8 +1660,9 @@ def test_publish_option_market_context_sets_latest_and_publishes():
     assert msg["activity"]["trade_count"] == 3
     assert msg["activity"]["contract_count"] == 2
     assert msg["most_traded_contracts"][0]["raw_symbol"] == "SPY   260505C00700000"
-    assert msg["cheap_side"] in {"calls", "puts"}
-    assert msg["pricing_quality"] == "usable"
+    assert msg["cheap_side"] == "balanced"
+    assert msg["pricing_quality"] == "degraded"
+    assert msg["pricing_quality_reason"] == "pricing_lag_range_too_small"
     assert worker.redis.xadds[0][1]["redis_key"] == key
     assert worker.redis.publishes[0][0] == "signal:option_market_context"
 
