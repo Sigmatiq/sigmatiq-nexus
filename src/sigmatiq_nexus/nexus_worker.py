@@ -384,6 +384,17 @@ def event_window_slot(dt_utc: datetime) -> dict | None:
     return None
 
 
+def latest_due_slot(slots: list[dict], reference_dt_utc: datetime, grace_seconds: int) -> dict | None:
+    reference_ny = reference_dt_utc.astimezone(NY)
+    due_slots = [
+        slot
+        for slot in slots
+        if reference_ny
+        >= datetime.combine(reference_ny.date(), slot["entry"], tzinfo=NY) + timedelta(seconds=grace_seconds)
+    ]
+    return due_slots[-1] if due_slots else None
+
+
 def input_streams() -> dict[str, str]:
     if INPUT_STREAM:
         return {INPUT_STREAM: STREAM_START_ID}
@@ -1569,17 +1580,24 @@ class SigmatiqNexus:
 
     async def evaluate_due_windows(self, reference_dt_utc: datetime) -> None:
         session_date = ny_session_date(reference_dt_utc)
+        latest_market_context_slot = latest_due_slot(
+            MARKET_CONTEXT_WINDOWS,
+            reference_dt_utc,
+            WINDOW_EVALUATION_GRACE_SECONDS,
+        )
+        latest_decision_slot = latest_due_slot(
+            DECISION_SLOTS,
+            reference_dt_utc,
+            WINDOW_EVALUATION_GRACE_SECONDS,
+        )
         for symbol in sorted(self.buffers):
             if symbol not in SYMBOLS:
                 continue
-            for slot in MARKET_CONTEXT_WINDOWS:
-                if not self._slot_due(reference_dt_utc, slot):
-                    continue
-                await self.publish_option_market_context_for_slot(symbol, slot, session_date)
-                await self.publish_participant_flow_context_for_slot(symbol, slot, session_date)
-            for slot in DECISION_SLOTS:
-                if not self._slot_due(reference_dt_utc, slot):
-                    continue
+            if latest_market_context_slot:
+                await self.publish_option_market_context_for_slot(symbol, latest_market_context_slot, session_date)
+                await self.publish_participant_flow_context_for_slot(symbol, latest_market_context_slot, session_date)
+            if latest_decision_slot:
+                slot = latest_decision_slot
                 key = window_eval_key(session_date, symbol, slot["entry_label"])
                 if key in self.evaluated_windows:
                     continue

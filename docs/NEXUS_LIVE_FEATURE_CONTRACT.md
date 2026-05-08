@@ -63,6 +63,7 @@ Current window-completion semantics:
 - the worker buffers live events by symbol
 - the scheduler checks due windows on every stream loop and after each processed event
 - a slot is due when `slot.entry + NEXUS_WINDOW_EVALUATION_GRACE_SECONDS` has passed in New York time
+- each scheduler pass processes only the latest due market-context slot and latest due strategy slot; after a restart Nexus does not backfill every missed historical window before returning to live stream consumption
 - each window evaluates once per session/symbol/entry label
 - window assignment is session-date aware; same clock-time rows from prior sessions must not satisfy today's window
 - if the in-memory buffer has no rows for a due slot, Nexus falls back to the raw Redis option stream and scans the latest `NEXUS_STREAM_WINDOW_LOOKBACK_COUNT` entries before declaring `empty_window`
@@ -401,7 +402,7 @@ Nexus also publishes a non-strategy market-context feed for `strategy-fit` and U
 | Latest key | `nexus_option_market_context:{symbol}:latest` | Latest completed context window for API aggregation. |
 | Pub/Sub | `signal:option_market_context` | Full payload for subscribers. |
 
-Market-context windows run every 30 minutes from `09:30-16:00` ET, plus optional `16:00-16:15`. Strategy decision slots remain limited to researched strategy windows.
+Market-context windows run every 30 minutes from `09:30-16:00` ET, plus optional `16:00-16:15`. Strategy decision slots remain limited to researched strategy windows. If the worker restarts mid-session, it resumes with the latest completed window rather than publishing a catch-up burst for all earlier windows.
 
 Payload includes premium totals, call/put premium bias, trade/contract counts, most-traded contracts, cheapest/costliest contracts, cheap/costly side, liquidity quality, pricing quality, and late-event impact.
 

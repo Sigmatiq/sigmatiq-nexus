@@ -2085,3 +2085,42 @@ def test_evaluate_allday_alert_respects_session_lock():
     # Second call should be locked
     asyncio.run(worker.evaluate_allday_alert(signal))
     assert len(worker.redis.sets) == first_count
+
+
+def test_latest_due_slot_returns_only_most_recent_due_window():
+    reference = datetime(2026, 5, 8, 16, 40, tzinfo=timezone.utc)  # 12:40 ET
+
+    slot = nw.latest_due_slot(nw.MARKET_CONTEXT_WINDOWS, reference, 0)
+
+    assert slot is not None
+    assert slot["entry_label"] == "w1200_1230"
+
+
+def test_evaluate_due_windows_does_not_backfill_all_missed_windows_after_restart():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.buffers = {"SPY": deque([{"symbol": "SPY"}], maxlen=10)}
+    worker.option_market_context_reported = set()
+    worker.participant_flow_reported = set()
+    worker.evaluated_windows = set()
+    calls: list[tuple[str, str]] = []
+
+    async def publish_option_market_context(symbol, slot, session_date):
+        calls.append(("market", slot["entry_label"]))
+
+    async def publish_participant_flow_context(symbol, slot, session_date):
+        calls.append(("participant", slot["entry_label"]))
+
+    async def evaluate_strategy(symbol, slot, reference_dt_utc):
+        calls.append(("strategy", slot["entry_label"]))
+
+    worker.publish_option_market_context_for_slot = publish_option_market_context
+    worker.publish_participant_flow_context_for_slot = publish_participant_flow_context
+    worker.evaluate_strategy = evaluate_strategy
+
+    asyncio.run(worker.evaluate_due_windows(datetime(2026, 5, 8, 16, 40, tzinfo=timezone.utc)))
+
+    assert calls == [
+        ("market", "w1200_1230"),
+        ("participant", "w1200_1230"),
+        ("strategy", "12:00"),
+    ]
