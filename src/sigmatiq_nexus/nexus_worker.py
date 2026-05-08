@@ -1746,7 +1746,7 @@ class SigmatiqNexus:
             self._log("window_skipped", symbol=symbol, session_date=str(session_date), reason="iv_rank_below_floor", iv_rank=iv_rank, entry_time=slot["entry_label"])
             return
 
-        slot_df = await self._window_df_for_symbol(symbol, slot, session_date)
+        slot_df = await self._window_df_for_symbol(symbol, slot, session_date, event_dt_utc)
         if slot_df.height == 0:
             self._log("window_skipped", symbol=symbol, session_date=str(session_date), reason="empty_window", entry_time=slot["entry_label"])
             return
@@ -1782,11 +1782,11 @@ class SigmatiqNexus:
         if not self.already_signaled(session_date, symbol, "*") and slot["entry_label"] == "11:00":
             await self.evaluate_momentum_specialist(slot_df, symbol, slot, session_date)
 
-    async def _window_df_for_symbol(self, symbol: str, slot: dict, session_date) -> pl.DataFrame:
+    async def _window_df_for_symbol(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> pl.DataFrame:
         buffer_df = window_df_for_slot(pl.DataFrame(list(self.buffers.get(symbol, []))), slot, session_date)
         if not buffer_df.is_empty():
             return buffer_df
-        stream_df = await self._window_df_from_stream(symbol, slot, session_date)
+        stream_df = await self._window_df_from_stream(symbol, slot, session_date, reference_time)
         if not stream_df.is_empty():
             self._log(
                 "window_stream_fallback_used",
@@ -1798,7 +1798,7 @@ class SigmatiqNexus:
             )
         return stream_df
 
-    async def _window_df_from_stream(self, symbol: str, slot: dict, session_date) -> pl.DataFrame:
+    async def _window_df_from_stream(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> pl.DataFrame:
         if not self.redis:
             return pl.DataFrame()
         rows = []
@@ -1825,7 +1825,63 @@ class SigmatiqNexus:
                 rows.append(payload)
         if not rows:
             return pl.DataFrame()
+        rows = await self._enrich_window_rows_from_live_state(symbol, rows, reference_time)
         return window_df_for_slot(pl.DataFrame(rows), slot, session_date)
+
+    async def _enrich_window_rows_from_live_state(self, symbol: str, rows: list[dict], reference_time: datetime | None) -> list[dict]:
+        """Attach current live quote/Greek context to raw Redis Stream fallback rows.
+
+        The in-memory buffer contains enriched rows, but high-volume windows can
+        exceed the bounded buffer and force a Redis Stream fallback. Stream
+        entries are raw OPRA trades, so enrich once per unique contract instead
+        of issuing one Redis read per trade.
+        """
+        if not rows or not self.redis:
+            return rows
+
+        equity_context = await read_json_payload(self.redis, EQUITY_CONTEXT_KEY_TEMPLATE.format(symbol=symbol))
+        raw_symbols = sorted({
+            normalize_raw_symbol(row.get("raw_symbol") or row.get("rawSymbol"))
+            for row in rows
+            if normalize_raw_symbol(row.get("raw_symbol") or row.get("rawSymbol"))
+        })
+
+        async def contract_payloads(raw_symbol: str) -> tuple[str, dict, dict]:
+            state_key = CONTRACT_STATE_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=raw_symbol)
+            tradability_key = CONTRACT_TRADABILITY_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=raw_symbol)
+            state, tradability = await asyncio.gather(
+                read_json_payload(self.redis, state_key),
+                read_json_payload(self.redis, tradability_key),
+            )
+            return raw_symbol, state, tradability
+
+        contract_map = {}
+        if raw_symbols:
+            for raw_symbol, state, tradability in await asyncio.gather(*(contract_payloads(raw) for raw in raw_symbols)):
+                contract_map[raw_symbol] = (state, tradability)
+
+        enriched_rows = []
+        for row in rows:
+            raw_symbol = normalize_raw_symbol(row.get("raw_symbol") or row.get("rawSymbol"))
+            state, tradability = contract_map.get(raw_symbol, ({}, {}))
+            enriched = dict(row)
+            _merge_underlying_context(enriched, equity_context)
+            _merge_contract_payload(enriched, state)
+            _merge_contract_payload(enriched, tradability)
+            normalized = normalize_trade_payload(enriched)
+            if reference_time is not None:
+                normalized["_feature_status"] = self._feature_status_at_reference_time(normalized, reference_time)
+            enriched_rows.append(normalized)
+        return enriched_rows
+
+    def _feature_status_at_reference_time(self, payload: dict, reference_time: datetime) -> dict[str, str]:
+        status = dict(payload.get("_feature_status") or {})
+        for feature in ("underlying_mid", "option_mid", "delta", "gamma"):
+            if feature not in payload:
+                status[feature] = "missing"
+                continue
+            status[feature] = _event_freshness_status(payload, reference_time, feature)
+        return status
 
     def already_signaled(self, session_date, symbol: str, strategy: str) -> bool:
         if symbol_lane_key(session_date, symbol) in self.signaled_today:

@@ -438,6 +438,56 @@ def test_window_df_for_symbol_falls_back_to_redis_stream_when_buffer_empty():
     assert df["premium"].sum() == 200_000
 
 
+def test_window_stream_fallback_enriches_rows_from_live_contract_state():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.buffers = {"SPY": deque()}
+    worker.redis = FakeRedis({
+        "equity:live:context:SPY": json.dumps({
+            "price": 700.25,
+            "lastPriceUtc": "2026-05-05T14:00:00Z",
+            "warmupComplete": True,
+            "priceDataStale": False,
+        }),
+        "options:live:contract_state:SPY   260505C00720000": json.dumps({
+            "optionMid": 1.24,
+            "bid": 1.23,
+            "ask": 1.25,
+            "delta": 0.52,
+            "gamma": 0.018,
+            "asOfUtc": "2026-05-05T14:00:00Z",
+            "greeksTsUtc": "2026-05-05T14:00:00Z",
+        }),
+    })
+    worker._log = lambda *args, **kwargs: None
+    worker.redis.xrevranges["md:SPY:options:trades"] = [
+        ("1-0", {b"data": msgpack.packb({
+            "underlying": "SPY",
+            "raw_symbol": "SPY   260505C00720000",
+            "price": 1.25,
+            "size": 10,
+            "side": 65,
+            "ts_event_ns": int(datetime(2026, 5, 5, 13, 40, tzinfo=timezone.utc).timestamp() * 1_000_000_000),
+        }, use_bin_type=True)}),
+    ]
+
+    df = asyncio.run(worker._window_df_for_symbol(
+        "SPY",
+        nw.DECISION_SLOTS[0],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 14, 0, tzinfo=timezone.utc),
+    ))
+
+    assert df.height == 1
+    row = df.to_dicts()[0]
+    assert row["option_mid"] == 1.24
+    assert row["underlying_mid"] == 700.25
+    assert row["delta"] == 0.52
+    assert row["gamma"] == 0.018
+    assert row["_feature_status"]["option_mid"] == "available"
+    assert row["_feature_status"]["underlying_mid"] == "available"
+    assert row["_feature_status"]["delta"] == "available"
+
+
 def test_cluster_mode_reads_each_input_stream_separately(monkeypatch):
     monkeypatch.setattr(nw, "REDIS_CLUSTER", True)
     redis_client = FakeXReadRedis()

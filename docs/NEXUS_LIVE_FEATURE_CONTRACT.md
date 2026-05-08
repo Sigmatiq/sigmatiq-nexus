@@ -66,6 +66,7 @@ Current window-completion semantics:
 - each window evaluates once per session/symbol/entry label
 - window assignment is session-date aware; same clock-time rows from prior sessions must not satisfy today's window
 - if the in-memory buffer has no rows for a due slot, Nexus falls back to the raw Redis option stream and scans the latest `NEXUS_STREAM_WINDOW_LOOKBACK_COUNT` entries before declaring `empty_window`
+- Redis Stream fallback rows are enriched once per unique `raw_symbol` from `options:live:contract_state:{rawSymbol}` / `options:live:tradability:{rawSymbol}` and once per symbol from `equity:live:context:{symbol}` before feature gates run; this avoids one Redis read per trade while preserving fail-closed behavior when current quote/Greek/spot context is stale or missing
 - this is safer than first-event-after-boundary evaluation, but it is still not a true upstream ingestion watermark
 
 ## Feature Availability Summary
