@@ -916,6 +916,13 @@ class SigmatiqNexus:
         }
         print(json.dumps(payload, default=str, separators=(",", ":")))
 
+    async def _publish(self, channel: str, payload: str) -> None:
+        publisher = getattr(self.redis, "publish", None)
+        if publisher:
+            await publisher(channel, payload)
+            return
+        await self.redis.execute_command("PUBLISH", channel, payload)
+
     def _window_log_fields(self, df: pl.DataFrame, slot: dict | None = None) -> dict:
         fields = {"rows": int(df.height)}
         if slot:
@@ -1383,7 +1390,7 @@ class SigmatiqNexus:
         redis_key = f"nexus_window_late_event:{symbol}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
-        await self.redis.publish("signal:window_late_event", json.dumps(msg))
+        await self._publish("signal:window_late_event", json.dumps(msg))
         self._log(
             "window_late_event_detected",
             symbol=symbol,
@@ -1460,7 +1467,7 @@ class SigmatiqNexus:
         await self._clear_active_position(position_session_date, symbol)
         await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
         await self._append_persistence_event(symbol, msg)
-        await self.redis.publish("nexus_live_overlay:updates", symbol)
+        await self._publish("nexus_live_overlay:updates", symbol)
         self._log("position_liquidated", symbol=symbol, reason=reason, return_pct=round(float(ret), 4))
 
     def _quote_from_payload(self, symbol: str, raw_symbol: str | None, payload: dict) -> dict:
@@ -1805,7 +1812,7 @@ class SigmatiqNexus:
         redis_key = f"nexus_window_view:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
-        await self.redis.publish(f"signal:window_view:{strategy}", json.dumps(msg))
+        await self._publish(f"signal:window_view:{strategy}", json.dumps(msg))
 
     async def _publish_window_view(self, strategy: str, symbol: str, sentiment: str, reason: str, slot: dict, session_date) -> None:
         key = (str(session_date), symbol, strategy, slot["entry_label"])
@@ -1842,7 +1849,7 @@ class SigmatiqNexus:
         redis_key = f"nexus_window_view:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
-        await self.redis.publish(f"signal:window_view:{strategy}", json.dumps(msg))
+        await self._publish(f"signal:window_view:{strategy}", json.dumps(msg))
         self._log("strategy_window_view_published", strategy=strategy, symbol=symbol, sentiment=sentiment, reason=reason, session_date=str(session_date), entry_time=slot["entry_label"])
 
     async def publish_window_pricing(self, df: pl.DataFrame, symbol: str, slot: dict, session_date) -> None:
@@ -1888,7 +1895,7 @@ class SigmatiqNexus:
         redis_key = f"nexus_window_pricing:{symbol}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
-        await self.redis.publish("signal:window_pricing", json.dumps(msg))
+        await self._publish("signal:window_pricing", json.dumps(msg))
         self._log("window_pricing_published", symbol=symbol, session_date=str(session_date), entry_time=slot["entry_label"], evaluated_contract_count=summary["evaluated_contract_count"])
 
     async def publish_option_market_context_for_slot(self, symbol: str, slot: dict, session_date) -> None:
@@ -1908,7 +1915,7 @@ class SigmatiqNexus:
         await self.redis.set(redis_key, json.dumps(msg))
         await self.redis.set(f"nexus_option_market_context:{symbol}:latest", json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
-        await self.redis.publish("signal:option_market_context", json.dumps(msg))
+        await self._publish("signal:option_market_context", json.dumps(msg))
         self._log(
             "option_market_context_published",
             symbol=symbol,
@@ -1934,7 +1941,7 @@ class SigmatiqNexus:
         await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
         await self.redis.set(f"nexus_participant_flow_context:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
         await self._append_persistence_event_for_key(redis_key, msg)
-        await self.redis.publish("signal:participant_flow_context", json.dumps(msg))
+        await self._publish("signal:participant_flow_context", json.dumps(msg))
         # Mark reported only after all writes succeed
         reported.add(key)
         self.participant_flow_reported = reported
@@ -2341,8 +2348,8 @@ class SigmatiqNexus:
         redis_key = f"nexus_intermediate:{symbol}:{strategy}:{entry_label}"
         await self.redis.set(redis_key, json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
-        await self.redis.publish("nexus_intermediate:updates", symbol)
-        await self.redis.publish(f"signal:intermediate:{strategy}", json.dumps(msg))
+        await self._publish("nexus_intermediate:updates", symbol)
+        await self._publish(f"signal:intermediate:{strategy}", json.dumps(msg))
         self._log("strategy_intermediate_published", strategy=strategy, symbol=symbol, sentiment=sentiment, entry_time=slot["entry_label"] if slot else None)
 
     async def _publish_final(self, strategy: str, symbol: str, sentiment: str, confidence: float, entry_price: float = 0.0, session_date=None, slot: dict | None = None, raw_symbol: str | None = None):
@@ -2443,7 +2450,7 @@ class SigmatiqNexus:
 
         await self.redis.set(f"nexus_live_overlay:{symbol}", json.dumps(msg))
         await self._append_persistence_event(symbol, msg)
-        await self.redis.publish("nexus_live_overlay:updates", symbol)
+        await self._publish("nexus_live_overlay:updates", symbol)
         self._log("strategy_final_published", strategy=strategy, symbol=symbol, sentiment=sentiment, confidence=round(float(confidence), 4), entry_price=round(float(entry_price), 4), session_date=str(key_date), entry_time=slot["entry_label"] if slot else None)
 
     async def _publish_spread_final(self, strategy: str, symbol: str, sentiment: str, confidence: float, session_date, slot: dict, candidate: dict):
@@ -2543,8 +2550,8 @@ class SigmatiqNexus:
         redis_key = f"nexus_spread_overlay:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
         await self._append_persistence_event_for_key(redis_key, msg)
-        await self.redis.publish("nexus_spread_overlay:updates", symbol)
-        await self.redis.publish(f"signal:spread:{strategy}", json.dumps(msg))
+        await self._publish("nexus_spread_overlay:updates", symbol)
+        await self._publish(f"signal:spread:{strategy}", json.dumps(msg))
         self._log(
             "strategy_spread_final_published",
             strategy=strategy,

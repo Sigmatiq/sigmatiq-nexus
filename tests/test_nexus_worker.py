@@ -311,6 +311,24 @@ class FakeXReadRedis:
         return [(stream_name, [(f"{len(self.calls)}-0", {b"data": b"{}"})])]
 
 
+class FakeClusterPublishRedis:
+    def __init__(self):
+        self.commands = []
+
+    async def execute_command(self, *args):
+        self.commands.append(args)
+        return 1
+
+
+def test_publish_falls_back_to_execute_command_for_cluster_client():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeClusterPublishRedis()
+
+    asyncio.run(worker._publish("signal:test", "payload"))
+
+    assert worker.redis.commands == [("PUBLISH", "signal:test", "payload")]
+
+
 def test_cluster_mode_reads_each_input_stream_separately(monkeypatch):
     monkeypatch.setattr(nw, "REDIS_CLUSTER", True)
     redis_client = FakeXReadRedis()
