@@ -247,8 +247,20 @@ def parse_optional_datetime(value) -> datetime | None:
     if isinstance(value, datetime):
         dt = value
     else:
+        raw = str(value).replace("Z", "+00:00")
+        if "." in raw:
+            head, tail = raw.split(".", 1)
+            frac = tail
+            suffix = ""
+            for marker in ("+", "-"):
+                if marker in tail:
+                    frac, rest = tail.split(marker, 1)
+                    suffix = f"{marker}{rest}"
+                    break
+            if len(frac) > 6:
+                raw = f"{head}.{frac[:6]}{suffix}"
         try:
-            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(raw)
         except (TypeError, ValueError):
             return None
     if dt.tzinfo is None:
@@ -848,6 +860,10 @@ def _merge_contract_payload(payload: dict, contract: dict) -> None:
     if mid is not None and mid > 0:
         _set_enriched_value(payload, "option_mid", mid)
 
+    underlying_mid = _payload_float(contract, "underlyingMid", "underlying_mid", "UnderlyingMid")
+    if underlying_mid is not None and underlying_mid > 0:
+        _set_enriched_value(payload, "underlying_mid", underlying_mid)
+
     for target, names in {
         "option_bid": ("bid", "Bid"),
         "option_ask": ("ask", "Ask"),
@@ -878,6 +894,7 @@ def _merge_contract_payload(payload: dict, contract: dict) -> None:
     ts = _payload_value(contract, "asOfUtc", "AsOfUtc", "tsUtc", "ts_utc", "asOf", "as_of")
     if ts is not None:
         payload.setdefault("quote_ts_utc", ts)
+        payload.setdefault("underlying_ts_utc", ts)
 
     quote_age_ms = _payload_float(contract, "quoteAgeMs", "quote_age_ms", "QuoteAgeMs")
     if quote_age_ms is not None:

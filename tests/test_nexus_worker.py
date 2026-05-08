@@ -101,6 +101,13 @@ def test_decode_msgpack_stream_entry_derives_live_trade_fields():
     assert decoded["ts_utc"].startswith("2026-")
 
 
+def test_parse_optional_datetime_accepts_dotnet_seven_digit_fractional_seconds():
+    parsed = nw.parse_optional_datetime("2026-05-08T16:22:19.2635803+00:00")
+
+    assert parsed is not None
+    assert parsed.isoformat() == "2026-05-08T16:22:19.263580+00:00"
+
+
 def test_decode_msgpack_databento_trade_side_does_not_override_option_side():
     payload = {
         "underlying": "SPY",
@@ -452,10 +459,11 @@ def test_window_stream_fallback_enriches_rows_from_live_contract_state():
             "optionMid": 1.24,
             "bid": 1.23,
             "ask": 1.25,
+            "underlyingMid": 700.30,
             "delta": 0.52,
             "gamma": 0.018,
-            "asOfUtc": "2026-05-05T14:00:00Z",
-            "greeksTsUtc": "2026-05-05T14:00:00Z",
+            "asOfUtc": "2026-05-05T14:00:00.1234567+00:00",
+            "greeksTsUtc": "2026-05-05T14:00:00.1234567+00:00",
         }),
     })
     worker._log = lambda *args, **kwargs: None
@@ -480,7 +488,7 @@ def test_window_stream_fallback_enriches_rows_from_live_contract_state():
     assert df.height == 1
     row = df.to_dicts()[0]
     assert row["option_mid"] == 1.24
-    assert row["underlying_mid"] == 700.25
+    assert row["underlying_mid"] == 700.30
     assert row["delta"] == 0.52
     assert row["gamma"] == 0.018
     assert row["_feature_status"]["option_mid"] == "available"
@@ -991,6 +999,7 @@ def test_enrich_trade_payload_from_redis_merges_underlying_and_contract_state():
         "equity:live:context:SPY": json.dumps({"price": 700.25, "lastPriceUtc": "2026-05-05T14:00:00Z"}),
         "options:live:contract_state:SPY   260505C00700000": json.dumps({
             "mid": 1.24,
+            "underlyingMid": 700.30,
             "quoteAgeMs": 250,
             "delta": 0.52,
             "gamma": 0.018,
@@ -1000,7 +1009,7 @@ def test_enrich_trade_payload_from_redis_merges_underlying_and_contract_state():
 
     enriched = asyncio.run(nw.enrich_trade_payload_from_redis(payload, redis_client))
 
-    assert enriched["underlying_mid"] == 700.25
+    assert enriched["underlying_mid"] == 700.30
     assert enriched["option_mid"] == 1.24
     assert enriched["delta"] == 0.52
     assert enriched["gamma"] == 0.018
