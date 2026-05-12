@@ -101,7 +101,7 @@ jobs:
               --env-vars \
                 "REDIS_URL=secretref:redis-url" \
                 "NEXUS_REDIS_CLUSTER=true" \
-                "NEXUS_SYMBOLS=SPY,QQQ" \
+                "NEXUS_SYMBOLS=SPY,QQQ,IWM,UVXY" \
                 "NEXUS_FIRST_TRIGGER_SCOPE=symbol" \
                 "NEXUS_GROUP_LOCK_STRATEGIES=etf_confluence_sniper" \
                 "IMAGE_TAG=${IMAGE_TAG}"
@@ -125,7 +125,7 @@ jobs:
               --set-env-vars \
                 "REDIS_URL=secretref:redis-url" \
                 "NEXUS_REDIS_CLUSTER=true" \
-                "NEXUS_SYMBOLS=SPY,QQQ" \
+                "NEXUS_SYMBOLS=SPY,QQQ,IWM,UVXY" \
                 "NEXUS_FIRST_TRIGGER_SCOPE=symbol" \
                 "NEXUS_GROUP_LOCK_STRATEGIES=etf_confluence_sniper" \
                 "IMAGE_TAG=${IMAGE_TAG}"

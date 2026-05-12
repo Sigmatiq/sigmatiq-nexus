@@ -290,6 +290,7 @@ Current state:
 
 - `options:live:tradability:{rawSymbol}` publishes quote/tradability state.
 - `options:live:contract_state:{rawSymbol}` publishes the same quote/tradability fields plus underlying spot and Greeks when the live Greek solve succeeds.
+- Nexus must read both padded OPRA raw symbols (`SPY   260511P00740000`) and compact raw symbols (`SPY260511P00740000`) for contract-state and tradability enrichment. Final quote lookup, stream-fallback enrichment, and direct payload enrichment should use the same variant lookup behavior so strategy gates do not block only because producers and consumers use different raw-symbol key formatting.
 - Runtime behavior: Nexus reads `options:live:contract_state:{rawSymbol}` first, then `options:live:tradability:{rawSymbol}` as a quote-only fallback.
 - Remaining gap: if the live Greek solve fails or spot is unavailable, contract-state payloads intentionally omit Greek fields and Nexus blocks strategies that require `delta`/`gamma`.
 
@@ -442,6 +443,11 @@ Cheap/costly contract and side reads are only emitted when Nexus has point-in-ti
   - Full-session participant flow context for completed 30-minute windows
   - Includes `window_side_read`, `retail_like_flow`, `institutional_like_flow`, `dealer_inferred_pressure`, `dominant_strategy_shape`, `top_contracts`, and `data_quality`
   - v1 publishes `dealer_inferred_pressure` as `unknown` until dealer context reads are wired
+- `HEALTH`
+  - Redis key: `health:nexus` unless `NEXUS_HEALTH_KEY` overrides it
+  - Source scope: `NEXUS_HEALTH_SYMBOLS`, default `SPY,QQQ,IWM,UVXY`
+  - Includes per-symbol input stream offsets, consumed counts, output family publish counts, blocked-message reason counts, and last worker errors
+  - This is a sidecar monitoring contract; strategy and market-context consumers should continue to read the canonical Nexus message keys above
   - v1 does not attempt spread/structure heuristic detection
   - TTL: 48 hours for window keys, 8 hours for latest key
   - See `docs/NEXUS_PARTICIPANT_FLOW_CONTEXT_DESIGN.md` for full schema and labeling taxonomy

@@ -24,7 +24,13 @@ from sigmatiq_nexus import participant_flow as pf
 # --- CONFIGURATION ---
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 REDIS_CLUSTER = os.environ.get("NEXUS_REDIS_CLUSTER", "false").strip().lower() == "true"
-SYMBOLS = {s.strip().upper() for s in os.environ.get("NEXUS_SYMBOLS", "SPY,QQQ").split(",") if s.strip()}
+SYMBOLS = {s.strip().upper() for s in os.environ.get("NEXUS_SYMBOLS", "SPY,QQQ,IWM,UVXY").split(",") if s.strip()}
+NEXUS_HEALTH_SYMBOLS = {
+    s.strip().upper()
+    for s in os.environ.get("NEXUS_HEALTH_SYMBOLS", "SPY,QQQ,IWM,UVXY").split(",")
+    if s.strip()
+}
+NEXUS_HEALTH_KEY = os.environ.get("NEXUS_HEALTH_KEY", "health:nexus")
 INPUT_STREAM = os.environ.get("NEXUS_INPUT_STREAM")
 STREAM_START_ID = os.environ.get("NEXUS_STREAM_START_ID", "0-0")
 FIRST_TRIGGER_SCOPE = os.environ.get("NEXUS_FIRST_TRIGGER_SCOPE", "symbol").strip().lower()
@@ -43,9 +49,6 @@ ACTIVE_POSITION_TTL_SECONDS = int(os.environ.get("NEXUS_ACTIVE_POSITION_TTL_SECO
 WINDOW_EVALUATION_GRACE_SECONDS = int(os.environ.get("NEXUS_WINDOW_EVALUATION_GRACE_SECONDS", "15"))
 STREAM_WINDOW_LOOKBACK_COUNT = int(os.environ.get("NEXUS_STREAM_WINDOW_LOOKBACK_COUNT", "20000"))
 
-IV_RANK_KEY_TEMPLATE = os.environ.get("NEXUS_IV_RANK_KEY", "stats:{symbol}:iv_rank")
-ATM_IV_KEY_TEMPLATE = os.environ.get("NEXUS_ATM_IV_KEY", "stats:{symbol}:atm_iv")
-NET_GEX_KEY_TEMPLATE = os.environ.get("NEXUS_NET_GEX_KEY", "stats:{symbol}:net_gex")
 IV_SURFACE_KEY_TEMPLATE = os.environ.get("NEXUS_IV_SURFACE_KEY", "options:live:iv_surface:{symbol}")
 VRP_KEY_TEMPLATE = os.environ.get("NEXUS_VRP_KEY", "options:live:vrp:{symbol}")
 GEX_KEY_TEMPLATE = os.environ.get("NEXUS_GEX_KEY", "options:live:gex:{symbol}")
@@ -176,7 +179,7 @@ CONTEXT_TIMESTAMP_FIELDS = (
     "updatedAt",
     "updated_at",
 )
-FRESH_STATUSES = {"available", "derived", "fallback"}
+FRESH_STATUSES = {"available", "derived"}
 STRATEGY_REQUIRED_FEATURES = {
     "etf_open_specialist": ("ts_utc", "symbol", "side", "premium", "iv_rank"),
     "etf_low_sweep_core": ("ts_utc", "symbol", "raw_symbol", "side", "premium", "is_sweep"),
@@ -297,7 +300,7 @@ def _payload_age_seconds(payload: dict, *names: str) -> float | None:
 def _freshness_status(reference_time: datetime | None, feature_time: datetime | None, max_age_seconds: int, missing_is_stale: bool) -> str:
     if not feature_time or not reference_time:
         return "unknown_freshness" if missing_is_stale else "available"
-    age_seconds = abs((reference_time - feature_time).total_seconds())
+    age_seconds = max(0.0, (reference_time - feature_time).total_seconds())
     return "available" if age_seconds <= max_age_seconds else "stale"
 
 
@@ -451,7 +454,7 @@ def nexus_index_key(session_date, symbol: str, kind: str) -> str:
     """Per-(session_date, symbol) index set used by sigmatiq-api to enumerate
     Nexus messages without scanning Redis. ``kind`` is one of ``window_view``,
     ``intermediate``, ``spread``, ``pricing``, ``late_event``, ``omc``,
-    ``participant_flow``."""
+    ``participant_flow``, ``final_block``."""
     return f"nexus:index:{session_date}:{symbol}:{kind}"
 
 
@@ -467,6 +470,54 @@ NEXUS_INDEX_TTL_SECONDS = 48 * 3600
 
 def redis_stream_offset_key(stream_name: str) -> str:
     return STREAM_OFFSET_KEY_TEMPLATE.format(stream=stream_name)
+
+
+def symbol_from_input_stream(stream_name: str) -> str | None:
+    parts = str(stream_name or "").split(":")
+    if len(parts) >= 4 and parts[0] == "md" and parts[2] == "options":
+        return parts[1].strip().upper() or None
+    return None
+
+
+def nexus_output_family(redis_key: str) -> str | None:
+    if redis_key.startswith("nexus_window_view:"):
+        return "window_view"
+    if redis_key.startswith("nexus_window_pricing:"):
+        return "window_pricing"
+    if redis_key.startswith("nexus_window_late_event:"):
+        return "window_late_event"
+    if redis_key.startswith("nexus_intermediate:"):
+        return "intermediate"
+    if redis_key.startswith("nexus_live_overlay:"):
+        return "live_overlay"
+    if redis_key.startswith("nexus_spread_overlay:"):
+        return "spread_overlay"
+    if redis_key.startswith("nexus_final_block:"):
+        return "final_block"
+    if redis_key.startswith("nexus_option_market_context:"):
+        return "option_market_context"
+    if redis_key.startswith("nexus_participant_flow_context:"):
+        return "participant_flow_context"
+    return None
+
+
+def nexus_output_symbol(redis_key: str) -> str | None:
+    parts = str(redis_key or "").split(":")
+    if len(parts) < 2:
+        return None
+    if parts[0] in {
+        "nexus_window_view",
+        "nexus_window_pricing",
+        "nexus_window_late_event",
+        "nexus_intermediate",
+        "nexus_live_overlay",
+        "nexus_spread_overlay",
+        "nexus_final_block",
+        "nexus_option_market_context",
+        "nexus_participant_flow_context",
+    }:
+        return parts[1].strip().upper() or None
+    return None
 
 
 def window_eval_key(session_date, symbol: str, entry_label: str) -> str:
@@ -857,11 +908,34 @@ async def read_json_payload(client, key: str) -> dict:
         return {}
 
 
+async def _read_contract_payloads(client, symbol: str, raw_symbol: str | None) -> tuple[dict, dict]:
+    """Read contract-state/tradability payloads across padded and compact OPRA keys."""
+    for candidate in _raw_symbol_key_variants(raw_symbol):
+        state_key = CONTRACT_STATE_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=candidate)
+        tradability_key = CONTRACT_TRADABILITY_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=candidate)
+        state, tradability = await asyncio.gather(
+            read_json_payload(client, state_key),
+            read_json_payload(client, tradability_key),
+        )
+        if state or tradability:
+            return state, tradability
+    return {}, {}
+
+
 def _set_enriched_value(payload: dict, field: str, value) -> None:
     if value in (None, ""):
         return
     status = (payload.get("_feature_status") or {}).get(field)
     if field not in payload or status not in FRESH_STATUSES:
+        payload[field] = value
+
+
+def _set_enriched_timestamp(payload: dict, field: str, value, freshness_fields: str | tuple[str, ...]) -> None:
+    if value in (None, ""):
+        return
+    fields = (freshness_fields,) if isinstance(freshness_fields, str) else freshness_fields
+    statuses = payload.get("_feature_status") or {}
+    if field not in payload or any(statuses.get(name) not in FRESH_STATUSES for name in fields):
         payload[field] = value
 
 
@@ -873,7 +947,7 @@ def _merge_underlying_context(payload: dict, context: dict) -> None:
         _set_enriched_value(payload, "underlying_mid", price)
     ts = _payload_value(context, "lastPriceUtc", "last_price_utc", "lastTradeUtc", "last_trade_utc", "tsUtc", "ts_utc")
     if ts is not None:
-        payload.setdefault("underlying_ts_utc", ts)
+        _set_enriched_timestamp(payload, "underlying_ts_utc", ts, "underlying_mid")
     warmup = _payload_bool(context, "warmupComplete", "warmup_complete")
     if warmup is not None:
         payload["underlying_warmup_complete"] = warmup
@@ -925,8 +999,8 @@ def _merge_contract_payload(payload: dict, contract: dict) -> None:
 
     ts = _payload_value(contract, "asOfUtc", "AsOfUtc", "tsUtc", "ts_utc", "asOf", "as_of")
     if ts is not None:
-        payload.setdefault("quote_ts_utc", ts)
-        payload.setdefault("underlying_ts_utc", ts)
+        _set_enriched_timestamp(payload, "quote_ts_utc", ts, "option_mid")
+        _set_enriched_timestamp(payload, "underlying_ts_utc", ts, "underlying_mid")
 
     quote_age_ms = _payload_float(contract, "quoteAgeMs", "quote_age_ms", "QuoteAgeMs")
     if quote_age_ms is not None:
@@ -944,21 +1018,18 @@ def _merge_contract_payload(payload: dict, contract: dict) -> None:
     if greek_ts is None and ts is not None and (_payload_has_any(contract, "delta", "gamma") or _payload_has_any(greeks, "delta", "gamma")):
         greek_ts = ts
     if greek_ts is not None:
-        payload.setdefault("greeks_ts_utc", greek_ts)
+        _set_enriched_timestamp(payload, "greeks_ts_utc", greek_ts, ("delta", "gamma"))
 
 
 async def enrich_trade_payload_from_redis(payload: dict, client) -> dict:
     symbol = str(payload.get("symbol") or "").strip().upper()
     raw_symbol = normalize_raw_symbol(payload.get("raw_symbol") or payload.get("rawSymbol"))
     equity_key = EQUITY_CONTEXT_KEY_TEMPLATE.format(symbol=symbol) if symbol else None
-    state_key = CONTRACT_STATE_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=raw_symbol) if raw_symbol else None
-    tradability_key = CONTRACT_TRADABILITY_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=raw_symbol) if raw_symbol else None
 
-    tasks = [
-        read_json_payload(client, key) if key else asyncio.sleep(0, result={})
-        for key in (equity_key, state_key, tradability_key)
-    ]
-    equity_context, contract_state, tradability = await asyncio.gather(*tasks)
+    equity_context, (contract_state, tradability) = await asyncio.gather(
+        read_json_payload(client, equity_key) if equity_key else asyncio.sleep(0, result={}),
+        _read_contract_payloads(client, symbol, raw_symbol) if raw_symbol else asyncio.sleep(0, result=({}, {})),
+    )
     enriched = dict(payload)
     _merge_underlying_context(enriched, equity_context)
     _merge_contract_payload(enriched, contract_state)
@@ -994,7 +1065,197 @@ class SigmatiqNexus:
         self.participant_flow_reported = set()
         self.evaluated_windows = set()
         self.late_window_impacts = {}
+        self.health_state = self._empty_health_state()
         self.redis = None
+
+    def _empty_health_state(self) -> dict:
+        return {
+            "inputs": {},
+            "outputs": {},
+            "blocked": {},
+            "last_error": None,
+            "last_error_utc": None,
+        }
+
+    def _health(self) -> dict:
+        state = getattr(self, "health_state", None)
+        if not isinstance(state, dict):
+            state = self._empty_health_state()
+            self.health_state = state
+        return state
+
+    def _record_nexus_error(self, error: str) -> None:
+        state = self._health()
+        state["last_error"] = str(error)
+        state["last_error_utc"] = datetime.now(timezone.utc).isoformat()
+
+    def _record_nexus_input(
+        self,
+        symbol: str | None,
+        stream_name: str | None,
+        msg_id=None,
+        event_dt_utc: datetime | None = None,
+        increment: bool = True,
+    ) -> None:
+        symbol = (symbol or symbol_from_input_stream(stream_name or "") or "").strip().upper()
+        if not symbol:
+            return
+        stream_name = stream_name or input_stream_for_symbol(symbol)
+        inputs = self._health().setdefault("inputs", {})
+        entry = inputs.setdefault(
+            symbol,
+            {
+                "stream": stream_name,
+                "offset_key": redis_stream_offset_key(stream_name),
+                "last_offset": None,
+                "last_input_utc": None,
+                "last_event_utc": None,
+                "consumed_count": 0,
+            },
+        )
+        entry["stream"] = stream_name
+        entry["offset_key"] = redis_stream_offset_key(stream_name)
+        if increment:
+            entry["consumed_count"] = int(entry.get("consumed_count") or 0) + 1
+        if msg_id is not None:
+            entry["last_offset"] = msg_id.decode("utf-8") if isinstance(msg_id, bytes) else str(msg_id)
+        entry["last_input_utc"] = datetime.now(timezone.utc).isoformat()
+        if event_dt_utc:
+            entry["last_event_utc"] = event_dt_utc.isoformat()
+
+    def _record_nexus_output(self, redis_key: str, msg: dict) -> None:
+        family = nexus_output_family(redis_key)
+        symbol = nexus_output_symbol(redis_key) or str((msg or {}).get("symbol") or "").strip().upper()
+        if not family or not symbol:
+            return
+        outputs = self._health().setdefault("outputs", {})
+        per_symbol = outputs.setdefault(symbol, {})
+        entry = per_symbol.setdefault(
+            family,
+            {
+                "count": 0,
+                "last_key": None,
+                "last_published_utc": None,
+                "last_decision": None,
+                "last_reason": None,
+            },
+        )
+        entry["count"] = int(entry.get("count") or 0) + 1
+        entry["last_key"] = redis_key
+        entry["last_published_utc"] = datetime.now(timezone.utc).isoformat()
+        entry["last_decision"] = (msg or {}).get("decision")
+        entry["last_reason"] = (msg or {}).get("reason") or (msg or {}).get("block_reason")
+
+        decision = str((msg or {}).get("decision") or "").upper()
+        if "BLOCKED" in decision or family == "final_block":
+            reason = str((msg or {}).get("reason") or (msg or {}).get("block_reason") or "unknown")
+            blocked = self._health().setdefault("blocked", {})
+            blocked_entry = blocked.setdefault(
+                symbol,
+                {
+                    "count": 0,
+                    "by_reason": {},
+                    "last_reason": None,
+                    "last_blocked_utc": None,
+                    "last_key": None,
+                },
+            )
+            blocked_entry["count"] = int(blocked_entry.get("count") or 0) + 1
+            blocked_entry["last_reason"] = reason
+            blocked_entry["last_blocked_utc"] = entry["last_published_utc"]
+            blocked_entry["last_key"] = redis_key
+            by_reason = blocked_entry.setdefault("by_reason", {})
+            by_reason[reason] = int(by_reason.get(reason) or 0) + 1
+
+    def _build_health_payload(self, now: datetime | None = None) -> dict:
+        now = now or datetime.now(timezone.utc)
+        state = self._health()
+        expected_symbols = sorted(NEXUS_HEALTH_SYMBOLS or SYMBOLS)
+        inputs = state.get("inputs") or {}
+        outputs = state.get("outputs") or {}
+        blocked = state.get("blocked") or {}
+
+        per_symbol = {}
+        active_symbols = []
+        missing_symbols = []
+        for symbol in expected_symbols:
+            input_entry = dict(inputs.get(symbol) or {})
+            output_entry = dict(outputs.get(symbol) or {})
+            input_ts = parse_optional_datetime(input_entry.get("last_input_utc"))
+            output_times = [
+                parse_optional_datetime(value.get("last_published_utc"))
+                for value in output_entry.values()
+                if isinstance(value, dict)
+            ]
+            latest_output = max([dt for dt in output_times if dt is not None], default=None)
+            last_update = max([dt for dt in (input_ts, latest_output) if dt is not None], default=None)
+            is_active = input_ts is not None or latest_output is not None
+            if is_active:
+                active_symbols.append(symbol)
+            else:
+                missing_symbols.append(symbol)
+
+            per_symbol[symbol] = {
+                "status": "healthy" if is_active else "missing",
+                "input": {
+                    "stream": input_entry.get("stream") or input_stream_for_symbol(symbol),
+                    "offsetKey": input_entry.get("offset_key") or redis_stream_offset_key(input_stream_for_symbol(symbol)),
+                    "lastOffset": input_entry.get("last_offset"),
+                    "lastInputUtc": input_entry.get("last_input_utc"),
+                    "lastInputAgeMs": int((now - input_ts).total_seconds() * 1000) if input_ts else None,
+                    "lastEventUtc": input_entry.get("last_event_utc"),
+                    "consumedCount": int(input_entry.get("consumed_count") or 0),
+                },
+                "outputs": output_entry,
+                "blocked": blocked.get(symbol) or {"count": 0, "by_reason": {}},
+                "lastUpdateUtc": last_update.isoformat() if last_update else None,
+                "degradedReasons": [] if is_active else ["missing_nexus_input_and_output"],
+            }
+
+        degraded_reasons = []
+        if missing_symbols:
+            degraded_reasons.append("missing_symbol_activity")
+        if state.get("last_error"):
+            degraded_reasons.append("last_error_present")
+
+        return {
+            "v": 1,
+            "kind": "live_pipeline_component_health",
+            "component": "nexus",
+            "feed": "nexus",
+            "status": "degraded" if degraded_reasons else "healthy",
+            "generatedAtUtc": now.isoformat(),
+            "healthKey": NEXUS_HEALTH_KEY,
+            "expectedSymbols": expected_symbols,
+            "activeSymbols": active_symbols,
+            "missingSymbols": missing_symbols,
+            "inputStreams": {symbol: input_stream_for_symbol(symbol) for symbol in expected_symbols},
+            "outputFamilies": [
+                "window_view",
+                "window_pricing",
+                "window_late_event",
+                "intermediate",
+                "live_overlay",
+                "spread_overlay",
+                "final_block",
+                "option_market_context",
+                "participant_flow_context",
+            ],
+            "persistenceStream": LIVE_PERSISTENCE_EVENT_STREAM,
+            "perSymbol": per_symbol,
+            "lastError": state.get("last_error"),
+            "lastErrorUtc": state.get("last_error_utc"),
+            "degradedReasons": degraded_reasons,
+        }
+
+    async def publish_health(self) -> None:
+        if not getattr(self, "redis", None):
+            return
+        payload = self._build_health_payload()
+        try:
+            await self.redis.set(NEXUS_HEALTH_KEY, json.dumps(payload, separators=(",", ":")))
+        except Exception as exc:
+            self._log("nexus_health_publish_failed", error=str(exc))
 
     def _log(self, event: str, **fields) -> None:
         payload = {
@@ -1327,13 +1588,15 @@ class SigmatiqNexus:
                         stream_name = stream.decode("utf-8") if isinstance(stream, bytes) else stream
                         for msg_id, data in messages:
                             streams[stream_name] = msg_id
-                            await self.process_message(data)
+                            await self.process_message(data, stream_name=stream_name, msg_id=msg_id)
                             await self.persist_stream_offset(stream_name, msg_id)
                 await self.evaluate_due_windows(datetime.now(timezone.utc))
                 if ALLDAY_ENABLED:
                     await self.poll_allday_alerts()
             except Exception as e:
                 self._log("main_loop_error", error=str(e))
+                self._record_nexus_error(str(e))
+                await self.publish_health()
                 await asyncio.sleep(1)
 
     def reset_if_new_session(self, event_dt_utc: datetime):
@@ -1359,14 +1622,20 @@ class SigmatiqNexus:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             streams[stream_name] = str(raw)
+            symbol = symbol_from_input_stream(stream_name)
+            if symbol:
+                self._record_nexus_input(symbol, stream_name, msg_id=str(raw), increment=False)
             restored += 1
         if restored:
             self._log("stream_offsets_restored", count=restored, streams=streams)
+            await self.publish_health()
 
     async def persist_stream_offset(self, stream_name: str, msg_id) -> None:
         if isinstance(msg_id, bytes):
             msg_id = msg_id.decode("utf-8")
         await self.redis.set(redis_stream_offset_key(stream_name), str(msg_id))
+        self._record_nexus_input(symbol_from_input_stream(stream_name), stream_name, msg_id=msg_id, increment=False)
+        await self.publish_health()
 
     async def restore_active_positions(self, session_date=None):
         session_date = session_date or self.last_reset_session_date
@@ -1517,7 +1786,7 @@ class SigmatiqNexus:
     async def _clear_active_position(self, session_date, symbol: str):
         await self.redis.delete(redis_active_position_key(session_date, symbol))
 
-    async def process_message(self, data):
+    async def process_message(self, data, stream_name: str | None = None, msg_id=None):
         try:
             payload = decode_stream_entry(data)
             symbol = str(payload["symbol"]).strip().upper()
@@ -1526,6 +1795,7 @@ class SigmatiqNexus:
 
             payload = await enrich_trade_payload_from_redis(payload, self.redis)
             event_dt_utc = parse_event_datetime(payload)
+            self._record_nexus_input(symbol, stream_name, msg_id=msg_id, event_dt_utc=event_dt_utc)
             self.reset_if_new_session(event_dt_utc)
 
             # --- DYNAMIC RISK MANAGEMENT (EXIT MONITORING) ---
@@ -1555,6 +1825,8 @@ class SigmatiqNexus:
             await self.evaluate_due_windows(event_dt_utc)
         except Exception as e:
             self._log("process_message_failed", error=str(e))
+            self._record_nexus_error(str(e))
+            await self.publish_health()
 
     async def _record_late_window_event(self, symbol: str, payload: dict, event_dt_utc: datetime) -> None:
         if not hasattr(self, "late_window_impacts"):
@@ -1885,7 +2157,8 @@ class SigmatiqNexus:
     async def _window_df_for_symbol(self, symbol: str, slot: dict, session_date, reference_time: datetime | None = None) -> pl.DataFrame:
         buffer_df = window_df_for_slot(pl.DataFrame(list(self.buffers.get(symbol, []))), slot, session_date)
         if not buffer_df.is_empty():
-            return buffer_df
+            rows = await self._enrich_window_rows_from_live_state(symbol, buffer_df.to_dicts(), reference_time)
+            return window_df_for_slot(pl.DataFrame(rows), slot, session_date)
         stream_df = await self._window_df_from_stream(symbol, slot, session_date, reference_time)
         if not stream_df.is_empty():
             self._log(
@@ -1929,12 +2202,12 @@ class SigmatiqNexus:
         return window_df_for_slot(pl.DataFrame(rows), slot, session_date)
 
     async def _enrich_window_rows_from_live_state(self, symbol: str, rows: list[dict], reference_time: datetime | None) -> list[dict]:
-        """Attach current live quote/Greek context to raw Redis Stream fallback rows.
+        """Attach current live quote/Greek context to window rows.
 
-        The in-memory buffer contains enriched rows, but high-volume windows can
-        exceed the bounded buffer and force a Redis Stream fallback. Stream
-        entries are raw OPRA trades, so enrich once per unique contract instead
-        of issuing one Redis read per trade.
+        Rows can come from the in-memory buffer or Redis Stream fallback. In both
+        cases, refresh from live Redis at completed-window evaluation so trades
+        that arrived before quote/Greek state became available are not
+        permanently blocked on stale arrival-time enrichment.
         """
         if not rows or not self.redis:
             return rows
@@ -1947,12 +2220,7 @@ class SigmatiqNexus:
         })
 
         async def contract_payloads(raw_symbol: str) -> tuple[str, dict, dict]:
-            state_key = CONTRACT_STATE_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=raw_symbol)
-            tradability_key = CONTRACT_TRADABILITY_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=raw_symbol)
-            state, tradability = await asyncio.gather(
-                read_json_payload(self.redis, state_key),
-                read_json_payload(self.redis, tradability_key),
-            )
+            state, tradability = await _read_contract_payloads(self.redis, symbol, raw_symbol)
             return raw_symbol, state, tradability
 
         contract_map = {}
@@ -1965,6 +2233,8 @@ class SigmatiqNexus:
             raw_symbol = normalize_raw_symbol(row.get("raw_symbol") or row.get("rawSymbol"))
             state, tradability = contract_map.get(raw_symbol, ({}, {}))
             enriched = dict(row)
+            if reference_time is not None:
+                enriched["_feature_status"] = self._feature_status_at_reference_time(enriched, reference_time)
             _merge_underlying_context(enriched, equity_context)
             _merge_contract_payload(enriched, state)
             _merge_contract_payload(enriched, tradability)
@@ -1997,29 +2267,22 @@ class SigmatiqNexus:
         return iv_rank, atm_iv, net_gex
 
     async def get_context_with_quality(self, symbol: str, reference_time: datetime | None = None) -> tuple[float, float, float, dict[str, str]]:
-        iv_rank_raw = await self.redis.get(IV_RANK_KEY_TEMPLATE.format(symbol=symbol))
-        atm_iv_raw = await self.redis.get(ATM_IV_KEY_TEMPLATE.format(symbol=symbol))
-        net_gex_raw = await self.redis.get(NET_GEX_KEY_TEMPLATE.format(symbol=symbol))
-        context_status = {
-            "iv_rank": "unknown_freshness" if iv_rank_raw and NEXUS_REQUIRE_CONTEXT_TIMESTAMPS else "available" if iv_rank_raw else "missing",
-            "atm_iv": "unknown_freshness" if atm_iv_raw and NEXUS_REQUIRE_CONTEXT_TIMESTAMPS else "available" if atm_iv_raw else "missing",
-            "net_gex": "unknown_freshness" if net_gex_raw and NEXUS_REQUIRE_CONTEXT_TIMESTAMPS else "available" if net_gex_raw else "missing",
-        }
-        iv_rank = float(iv_rank_raw or 50.0)
-        atm_iv = float(atm_iv_raw or 0.15)
-        net_gex = float(net_gex_raw or 0.0)
-        if not atm_iv_raw:
-            atm_iv, found, payload = await self._context_float_with_status(IV_SURFACE_KEY_TEMPLATE.format(symbol=symbol), "atmIv", atm_iv)
-            if found:
-                context_status["atm_iv"] = self._context_freshness_status(payload, reference_time, "atm_iv")
-        if not net_gex_raw:
-            net_gex, found, payload = await self._context_float_with_status(GEX_KEY_TEMPLATE.format(symbol=symbol), "netGex", net_gex)
-            if found:
-                context_status["net_gex"] = self._context_freshness_status(payload, reference_time, "net_gex")
-        if not iv_rank_raw:
-            iv_rank, found, payload = await self._iv_rank_from_vrp_with_status(symbol, iv_rank)
-            if found:
-                context_status["iv_rank"] = self._context_freshness_status(payload, reference_time, "iv_rank")
+        context_status = {"iv_rank": "missing", "atm_iv": "missing", "net_gex": "missing"}
+        iv_rank = 50.0
+        atm_iv = 0.15
+        net_gex = 0.0
+
+        atm_iv, found, payload = await self._context_float_with_status(IV_SURFACE_KEY_TEMPLATE.format(symbol=symbol), "atmIv", atm_iv)
+        if found:
+            context_status["atm_iv"] = self._context_freshness_status(payload, reference_time, "atm_iv")
+
+        net_gex, found, payload = await self._context_float_with_status(GEX_KEY_TEMPLATE.format(symbol=symbol), "netGex", net_gex)
+        if found:
+            context_status["net_gex"] = self._context_freshness_status(payload, reference_time, "net_gex")
+
+        iv_rank, found, payload = await self._iv_rank_from_vrp_with_status(symbol, iv_rank)
+        if found:
+            context_status["iv_rank"] = self._context_freshness_status(payload, reference_time, "iv_rank")
         return iv_rank, atm_iv, net_gex, context_status
 
     async def _context_float(self, key: str, field: str, default: float) -> float:
@@ -2053,15 +2316,6 @@ class SigmatiqNexus:
             payload = json.loads(raw)
             if payload.get("ivRank") is not None:
                 return float(payload["ivRank"]), True, payload
-            regime = str(payload.get("vrpRegime") or "").lower()
-            mapped = {"cheap": 20.0, "fair": 50.0, "moderate": 60.0, "rich": 80.0, "elevated": 90.0}.get(regime)
-            if mapped is not None:
-                return mapped, True, payload
-            # Live VRP exists but may not yet carry historical rank/regime. Use
-            # the conservative default as a fresh fallback so diagnostics and
-            # window views can publish without inventing a cheap-vol signal.
-            if _payload_datetime(payload, CONTEXT_TIMESTAMP_FIELDS):
-                return default, True, payload
             return default, False, payload
         except Exception:
             return default, False, {}
@@ -2071,8 +2325,7 @@ class SigmatiqNexus:
         if not feature_time and NEXUS_REQUIRE_CONTEXT_TIMESTAMPS:
             return "unknown_freshness"
         max_age = FEATURE_MAX_AGE_SECONDS[feature]
-        status = _freshness_status(reference_time, feature_time, max_age, missing_is_stale=NEXUS_REQUIRE_CONTEXT_TIMESTAMPS)
-        return "fallback" if status == "available" else status
+        return _freshness_status(reference_time, feature_time, max_age, missing_is_stale=NEXUS_REQUIRE_CONTEXT_TIMESTAMPS)
 
     async def _strategy_features_ready(self, strategy: str, symbol: str, df: pl.DataFrame, slot: dict, session_date, reference_time: datetime | None = None) -> bool:
         failures = await self._strategy_feature_failures(strategy, symbol, df, reference_time)
@@ -2750,6 +3003,16 @@ class SigmatiqNexus:
             
         if not is_allowed:
             self._log("strategy_final_blocked_by_whitelist", strategy=strategy, symbol=symbol, sentiment=sentiment)
+            await self._publish_final_block(
+                strategy,
+                symbol,
+                sentiment,
+                session_date,
+                slot,
+                "strategy_final_blocked_by_whitelist",
+                {"sentiment": sentiment},
+                raw_symbol,
+            )
             return
 
         if slot is None and isinstance(session_date, dict) and isinstance(entry_price, date):
@@ -2768,10 +3031,30 @@ class SigmatiqNexus:
                 quote_freshness=execution["quote_freshness"],
                 entry_time=slot["entry_label"] if slot else None,
             )
+            await self._publish_final_block(
+                strategy,
+                symbol,
+                sentiment,
+                session_date,
+                slot,
+                "strategy_final_blocked_by_quote",
+                {"execution": execution, "quote": quote},
+                raw_symbol,
+            )
             return
         entry_price = execution["reference_price"]
         key_date = session_date or ny_session_date(datetime.now(timezone.utc))
         if not await self._acquire_final_locks(key_date, symbol, strategy, signal_id):
+            await self._publish_final_block(
+                strategy,
+                symbol,
+                sentiment,
+                key_date,
+                slot,
+                "strategy_final_blocked_by_lock",
+                {"signal_id": signal_id},
+                raw_symbol,
+            )
             return
         msg = {
             "message_id": new_message_id(),
@@ -2876,6 +3159,26 @@ class SigmatiqNexus:
                     "tradability_bucket": quote.get("tradability_bucket"),
                 },
             })
+        if quote_freshness not in FRESH_STATUSES:
+            await self._publish_final_block(
+                strategy,
+                symbol,
+                sentiment,
+                session_date,
+                slot,
+                "strategy_spread_final_blocked_by_quote",
+                {"executions": executions, "candidate": {k: v for k, v in candidate.items() if k != "legs"}},
+                raw_symbol,
+            )
+            self._log(
+                "strategy_spread_final_blocked_by_quote",
+                strategy=strategy,
+                symbol=symbol,
+                sentiment=sentiment,
+                entry_time=slot["entry_label"],
+                quote_freshness=quote_freshness,
+            )
+            return
         msg = {
             "message_id": new_message_id(),
             "signal_id": signal_id,
@@ -2957,10 +3260,52 @@ class SigmatiqNexus:
             entry_time=slot["entry_label"],
         )
 
+    async def _publish_final_block(
+        self,
+        strategy: str,
+        symbol: str,
+        sentiment: str | None,
+        session_date,
+        slot: dict | None,
+        reason: str,
+        details: dict | None = None,
+        raw_symbol: str | None = None,
+    ):
+        key_date = session_date or ny_session_date(datetime.now(timezone.utc))
+        entry_label = slot["entry_label"] if slot else "na"
+        msg = {
+            "message_id": new_message_id(),
+            "signal_id": build_signal_id(strategy, symbol, key_date, slot, raw_symbol),
+            "strategy": strategy,
+            "symbol": symbol,
+            "stage": 2,
+            "decision": "FINAL_BLOCKED",
+            "sentiment": sentiment,
+            "reason": reason,
+            "details": details or {},
+            "raw_symbol": raw_symbol,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_date": str(key_date),
+            "entry_time": entry_label,
+            "source": "sigmatiq_nexus",
+        }
+        if slot:
+            msg.update({
+                "window_start": slot["window_start"].isoformat(),
+                "window_end": slot["window_end"].isoformat(),
+            })
+        msg.update(narratives.build_lifecycle_reason_summary(msg))
+        redis_key = f"nexus_final_block:{symbol}:{strategy}:{entry_label}"
+        await self.redis.set(redis_key, json.dumps(msg), ex=NEXUS_INDEX_TTL_SECONDS)
+        await self._index_sadd(nexus_index_key(key_date, symbol, "final_block"), f"{strategy}:{entry_label}")
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish(f"signal:final_block:{strategy}", json.dumps(msg))
+
     async def _append_persistence_event(self, symbol, msg):
         await self._append_persistence_event_for_key(f"nexus_live_overlay:{symbol}", msg)
 
     async def _append_persistence_event_for_key(self, redis_key: str, msg):
+        self._record_nexus_output(redis_key, msg if isinstance(msg, dict) else {})
         try:
             await self.redis.xadd(
                 LIVE_PERSISTENCE_EVENT_STREAM,
@@ -2969,7 +3314,9 @@ class SigmatiqNexus:
                 approximate=True,
             )
         except Exception as exc:
+            self._record_nexus_error(str(exc))
             self._log("persistence_event_append_failed", redis_key=redis_key, error=str(exc))
+        await self.publish_health()
 
     async def _index_sadd(self, key: str, member: str, ttl_seconds: int = NEXUS_INDEX_TTL_SECONDS) -> None:
         """Add a member to a per-session index set so sigmatiq-api can enumerate

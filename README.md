@@ -55,13 +55,14 @@ Nexus publishes a market-context feed separate from strategy signals. Strategy d
 - `NEXUS_INPUT_STREAM`: optional explicit Redis stream. If absent, Nexus consumes `md:{symbol}:options:trades`.
 - `NEXUS_STREAM_START_ID`: initial Redis Stream ID when no stored offset exists, default `0-0`.
 - `NEXUS_STREAM_OFFSET_KEY`: Redis key template for saved stream offsets, default `nexus:stream_offset:{stream}`.
-- `NEXUS_SYMBOLS`: comma-separated symbols to process, default `SPY,QQQ`.
+- `NEXUS_SYMBOLS`: comma-separated symbols to process, default `SPY,QQQ,IWM,UVXY`.
+- `NEXUS_HEALTH_SYMBOLS`: comma-separated symbols that must appear in Nexus health, default `SPY,QQQ,IWM,UVXY`.
+- `NEXUS_HEALTH_KEY`: Redis key for the Nexus health payload, default `health:nexus`.
 - `NEXUS_GROUP_LOCK_STRATEGIES`: comma-separated strategy names that should also share one cross-symbol group lock, default `etf_confluence_sniper`.
 - `NEXUS_LOCK_TTL_SECONDS`: Redis first-trigger lock TTL, default `28800`.
 - `NEXUS_ACTIVE_POSITION_TTL_SECONDS`: Redis active-position state TTL, default `28800`.
 - `NEXUS_WINDOW_EVALUATION_GRACE_SECONDS`: delay after a decision boundary before evaluating the completed window, default `15`.
-- `NEXUS_IV_RANK_KEY`, `NEXUS_ATM_IV_KEY`, `NEXUS_NET_GEX_KEY`: optional direct Redis key templates for live context, each using `{symbol}`.
-- `NEXUS_IV_SURFACE_KEY`, `NEXUS_VRP_KEY`, `NEXUS_GEX_KEY`: live options-worker fallback key templates, defaulting to `options:live:*:{symbol}` keys.
+- `NEXUS_IV_SURFACE_KEY`, `NEXUS_VRP_KEY`, `NEXUS_GEX_KEY`: canonical live options-worker context key templates, defaulting to `options:live:*:{symbol}` keys. Nexus does not use legacy scalar fallback keys for strategy readiness.
 - `NEXUS_EQUITY_CONTEXT_KEY`: equity live context key template, default `equity:live:context:{symbol}`.
 - `NEXUS_CONTRACT_TRADABILITY_KEY`: option tradability key template, default `options:live:tradability:{raw_symbol}`.
 - `NEXUS_CONTRACT_STATE_KEY`: per-contract quote plus Greek state key template, default `options:live:contract_state:{raw_symbol}`.
@@ -81,6 +82,20 @@ Nexus publishes a market-context feed separate from strategy signals. Strategy d
 - `NEXUS_MIN_WINDOW_PREMIUM` and `NEXUS_SIDE_DOMINANCE`: window-level premium and side-dominance thresholds.
 - `NEXUS_OPEN_CALL_DOMINANCE`: opening cheap-call dominance threshold, default `1.5`.
 - `LIVE_PERSISTENCE_EVENT_STREAM`: Redis Stream for durable signal capture, default `live:persistence:events`.
+
+## Health contract
+
+Nexus publishes a sidecar health payload to `health:nexus`. The payload is fail-closed operational evidence for the four-symbol pilot universe and includes:
+
+- `expectedSymbols`, `activeSymbols`, and `missingSymbols`.
+- Per-symbol input stream name, offset key, last consumed offset, last input timestamp, event timestamp, and consumed count.
+- Per-symbol output families and publish counts for `window_view`, `window_pricing`, `window_late_event`, `intermediate`, `live_overlay`, `spread_overlay`, `final_block`, `option_market_context`, and `participant_flow_context`.
+- Per-symbol blocked-message counts and counts by reason, including final-block and live-feature-quality gate reasons.
+- `lastError`, `lastErrorUtc`, and `degradedReasons`.
+
+This key is intended for sigmatiq-api and pipeline monitoring. Nexus still writes the canonical payload keys and appends to `live:persistence:events`; the health key does not replace those contracts.
+
+Operationally, a valid no-trade day means the symbol has fresh input activity and Nexus output families such as `window_view`, `window_pricing`, `option_market_context`, or `participant_flow_context` are advancing, while `final_block` or `BLOCKED` counts explain any fail-closed decisions. An unhealthy pipeline has missing symbol activity, stale or absent offsets, no advancing output families, or a populated `lastError`.
 
 ## Feature audit
 

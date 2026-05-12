@@ -108,6 +108,13 @@ def test_parse_optional_datetime_accepts_dotnet_seven_digit_fractional_seconds()
     assert parsed.isoformat() == "2026-05-08T16:22:19.263580+00:00"
 
 
+def test_freshness_allows_context_newer_than_reference_time():
+    reference = datetime(2026, 5, 5, 14, 0, tzinfo=timezone.utc)
+    feature_time = datetime(2026, 5, 5, 14, 20, tzinfo=timezone.utc)
+
+    assert nw._freshness_status(reference, feature_time, 120, missing_is_stale=True) == "available"
+
+
 def test_decode_msgpack_databento_trade_side_does_not_override_option_side():
     payload = {
         "underlying": "SPY",
@@ -256,7 +263,37 @@ def test_open_specialist_uses_cheap_call_dominance_for_1000_entry():
     assert asyncio.run(worker.check_open_specialist_heuristic(df, "SPY", nw.DECISION_SLOTS[1])) == (None, False)
 
 
-def test_vrp_payload_without_rank_satisfies_iv_rank_as_conservative_fallback():
+def test_context_uses_canonical_live_keys():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:vrp:SPY": json.dumps({
+            "symbol": "SPY",
+            "tsUtc": "2026-05-05T14:00:00Z",
+            "ivRank": 24.0,
+        }),
+        "options:live:iv_surface:SPY": json.dumps({
+            "symbol": "SPY",
+            "tsUtc": "2026-05-05T14:00:00Z",
+            "atmIv": 0.42,
+        }),
+        "options:live:gex:SPY": json.dumps({
+            "symbol": "SPY",
+            "tsUtc": "2026-05-05T14:00:00Z",
+            "netGex": -1250000,
+        }),
+    })
+
+    iv_rank, atm_iv, net_gex, status = asyncio.run(
+        worker.get_context_with_quality("SPY", datetime(2026, 5, 5, 14, 0, 30, tzinfo=timezone.utc))
+    )
+
+    assert iv_rank == 24.0
+    assert atm_iv == 0.42
+    assert net_gex == -1250000
+    assert status == {"iv_rank": "available", "atm_iv": "available", "net_gex": "available"}
+
+
+def test_vrp_payload_without_rank_does_not_satisfy_iv_rank():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.redis = FakeRedis({
         "options:live:vrp:SPY": json.dumps({
@@ -273,7 +310,7 @@ def test_vrp_payload_without_rank_satisfies_iv_rank_as_conservative_fallback():
     )
 
     assert iv_rank == 50.0
-    assert status["iv_rank"] == "fallback"
+    assert status["iv_rank"] == "missing"
 
 
 def test_low_sweep_core_allows_only_research_windows_and_sides():
@@ -333,7 +370,7 @@ def test_workflow_uses_configured_redis_host_variable():
     assert "rg-sigmatiq-prod" in text
     assert "secrets.NEXUS_REDIS_URL" in text
     assert "NEXUS_REDIS_CLUSTER=true" in text
-    assert "NEXUS_SYMBOLS=SPY,QQQ" in text
+    assert "NEXUS_SYMBOLS=SPY,QQQ,IWM,UVXY" in text
     assert "NEXUS_FIRST_TRIGGER_SCOPE=symbol" in text
     assert "NEXUS_GROUP_LOCK_STRATEGIES=etf_confluence_sniper" in text
 
@@ -347,9 +384,60 @@ def test_cluster_connection_does_not_disable_tls_verification():
 
 
 def test_default_symbols_and_scope_cover_combined_etf_sniper():
-    assert {"SPY", "QQQ"}.issubset(nw.SYMBOLS)
+    assert {"SPY", "QQQ", "IWM", "UVXY"}.issubset(nw.SYMBOLS)
+    assert {"SPY", "QQQ", "IWM", "UVXY"}.issubset(nw.NEXUS_HEALTH_SYMBOLS)
     assert nw.FIRST_TRIGGER_SCOPE == "symbol"
     assert "etf_confluence_sniper" in nw.GROUP_LOCK_STRATEGIES
+
+
+def test_nexus_health_payload_reports_inputs_outputs_and_blocked_reasons():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.health_state = worker._empty_health_state()
+
+    event_time = datetime(2026, 5, 12, 13, 31, tzinfo=timezone.utc)
+    worker._record_nexus_input("SPY", "md:SPY:options:trades", msg_id="171-0", event_dt_utc=event_time)
+    worker._record_nexus_output(
+        "nexus_final_block:SPY:etf_open_specialist:10:00",
+        {
+            "symbol": "SPY",
+            "decision": "FINAL_BLOCKED",
+            "reason": "strategy_final_blocked_by_quote",
+        },
+    )
+
+    payload = worker._build_health_payload(datetime(2026, 5, 12, 13, 32, tzinfo=timezone.utc))
+
+    assert payload["component"] == "nexus"
+    assert payload["healthKey"] == "health:nexus"
+    assert "SPY" in payload["activeSymbols"]
+    assert payload["perSymbol"]["SPY"]["input"]["stream"] == "md:SPY:options:trades"
+    assert payload["perSymbol"]["SPY"]["input"]["lastOffset"] == "171-0"
+    assert payload["perSymbol"]["SPY"]["outputs"]["final_block"]["count"] == 1
+    assert payload["perSymbol"]["SPY"]["blocked"]["by_reason"]["strategy_final_blocked_by_quote"] == 1
+    assert "missing_symbol_activity" in payload["degradedReasons"]
+
+
+def test_append_persistence_event_publishes_nexus_health_key():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    worker.health_state = worker._empty_health_state()
+
+    asyncio.run(
+        worker._append_persistence_event_for_key(
+            "nexus_window_view:SPY:etf_open_specialist:10:00",
+            {
+                "symbol": "SPY",
+                "decision": "BLOCKED",
+                "block_reason": "live_feature_quality_gate_closed",
+            },
+        )
+    )
+
+    assert nw.NEXUS_HEALTH_KEY in worker.redis.values
+    payload = json.loads(worker.redis.values[nw.NEXUS_HEALTH_KEY])
+    assert payload["perSymbol"]["SPY"]["outputs"]["window_view"]["count"] == 1
+    assert payload["perSymbol"]["SPY"]["blocked"]["by_reason"]["live_feature_quality_gate_closed"] == 1
+    assert worker.redis.xadds[-1][0] == nw.LIVE_PERSISTENCE_EVENT_STREAM
 
 class FakeRedis:
     def __init__(self, values=None):
@@ -534,6 +622,112 @@ def test_window_stream_fallback_enriches_rows_from_live_contract_state():
     assert row["_feature_status"]["delta"] == "available"
 
 
+def test_window_buffer_refreshes_stale_rows_from_live_contract_state():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    stale_trade = nw.normalize_trade_payload({
+        "symbol": "SPY",
+        "raw_symbol": "SPY   260505C00720000",
+        "side": "C",
+        "price": 1.0,
+        "size": 10,
+        "ts_utc": "2026-05-05T13:40:00Z",
+        "option_mid": 1.0,
+        "underlying_mid": 699.0,
+        "delta": 0.40,
+        "gamma": 0.010,
+        "quote_ts_utc": "2026-05-05T13:40:00Z",
+        "underlying_ts_utc": "2026-05-05T13:40:00Z",
+        "greeks_ts_utc": "2026-05-05T13:40:00Z",
+    })
+    worker.buffers = {"SPY": deque([stale_trade])}
+    worker.redis = FakeRedis({
+        "equity:live:context:SPY": json.dumps({
+            "price": 700.25,
+            "lastPriceUtc": "2026-05-05T14:00:00Z",
+            "warmupComplete": True,
+            "priceDataStale": False,
+        }),
+        "options:live:contract_state:SPY   260505C00720000": json.dumps({
+            "optionMid": 1.24,
+            "bid": 1.23,
+            "ask": 1.25,
+            "underlyingMid": 700.30,
+            "delta": 0.52,
+            "gamma": 0.018,
+            "asOfUtc": "2026-05-05T14:00:00Z",
+            "greeksTsUtc": "2026-05-05T14:00:00Z",
+        }),
+    })
+    worker._log = lambda *args, **kwargs: None
+
+    df = asyncio.run(worker._window_df_for_symbol(
+        "SPY",
+        nw.DECISION_SLOTS[0],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 14, 0, tzinfo=timezone.utc),
+    ))
+
+    assert df.height == 1
+    row = df.to_dicts()[0]
+    assert row["option_mid"] == 1.24
+    assert row["underlying_mid"] == 700.30
+    assert row["delta"] == 0.52
+    assert row["gamma"] == 0.018
+    assert row["quote_ts_utc"] == "2026-05-05T14:00:00Z"
+    assert row["greeks_ts_utc"] == "2026-05-05T14:00:00Z"
+    assert row["_feature_status"]["option_mid"] == "available"
+    assert row["_feature_status"]["underlying_mid"] == "available"
+    assert row["_feature_status"]["delta"] == "available"
+    assert row["_feature_status"]["gamma"] == "available"
+
+
+def test_window_stream_fallback_enriches_rows_from_compact_contract_state_key():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.buffers = {"SPY": deque()}
+    worker.redis = FakeRedis({
+        "equity:live:context:SPY": json.dumps({
+            "price": 700.25,
+            "lastPriceUtc": "2026-05-05T14:00:00Z",
+            "warmupComplete": True,
+            "priceDataStale": False,
+        }),
+        "options:live:contract_state:SPY260505C00720000": json.dumps({
+            "optionMid": 1.24,
+            "bid": 1.23,
+            "ask": 1.25,
+            "underlyingMid": 700.30,
+            "delta": 0.52,
+            "gamma": 0.018,
+            "asOfUtc": "2026-05-05T14:00:00Z",
+            "greeksTsUtc": "2026-05-05T14:00:00Z",
+        }),
+    })
+    worker._log = lambda *args, **kwargs: None
+    worker.redis.xrevranges["md:SPY:options:trades"] = [
+        ("1-0", {b"data": msgpack.packb({
+            "underlying": "SPY",
+            "raw_symbol": "SPY   260505C00720000",
+            "price": 1.25,
+            "size": 10,
+            "side": 65,
+            "ts_event_ns": int(datetime(2026, 5, 5, 13, 59, tzinfo=timezone.utc).timestamp() * 1_000_000_000),
+        }, use_bin_type=True)}),
+    ]
+
+    df = asyncio.run(worker._window_df_for_symbol(
+        "SPY",
+        nw.DECISION_SLOTS[0],
+        date(2026, 5, 5),
+        datetime(2026, 5, 5, 14, 0, tzinfo=timezone.utc),
+    ))
+
+    assert df.height == 1
+    row = df.to_dicts()[0]
+    assert row["option_mid"] == 1.24
+    assert row["delta"] == 0.52
+    assert row["_feature_status"]["option_mid"] == "available"
+
+
 def test_cluster_mode_reads_each_input_stream_separately(monkeypatch):
     monkeypatch.setattr(nw, "REDIS_CLUSTER", True)
     redis_client = FakeXReadRedis()
@@ -651,6 +845,13 @@ def test_publish_final_blocks_when_quote_is_missing():
 
     assert not any(key == "nexus_live_overlay:SPY" for key, _ in worker.redis.sets)
     assert not worker.already_signaled(datetime(2026, 5, 5).date(), "SPY", "etf_low_sweep_core")
+    block = json.loads(worker.redis.values["nexus_final_block:SPY:etf_low_sweep_core:10:00"])
+    assert block["decision"] == "FINAL_BLOCKED"
+    assert block["reason"] == "strategy_final_blocked_by_quote"
+    assert block["raw_symbol"] == "SPY   260505C00720000"
+    assert worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "final_block")] == {"etf_low_sweep_core:10:00"}
+    assert worker.redis.xadds[-1][1]["redis_key"] == "nexus_final_block:SPY:etf_low_sweep_core:10:00"
+    assert worker.redis.publishes[-1][0] == "signal:final_block:etf_low_sweep_core"
 
 
 def test_publish_final_blocks_when_redis_lock_exists():
@@ -968,7 +1169,7 @@ def test_put_credit_open30_spread_publishes_paper_bet():
     worker.signaled_today = set()
     worker.active_positions = {}
     worker.redis = FakeRedis({
-        "options:live:vrp:SPY": json.dumps({"ivRank": 20, "asOf": "2026-05-05T13:50:00Z"}),
+        "options:live:vrp:SPY": json.dumps({"ivRank": 20, "asOf": "2026-05-05T14:00:00Z"}),
         "options:live:contract_state:SPY   260505P00715000": _contract_state(0.575, 0.55, 0.60),
         "options:live:contract_state:SPY   260505P00710000": _contract_state(0.175, 0.15, 0.20),
     })
@@ -1087,6 +1288,70 @@ def test_spread_candidate_rejects_low_credit():
     asyncio.run(worker.evaluate_put_credit_open30_spread(df, "SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
 
     assert not any(key.startswith("nexus_spread_overlay:") for key, _ in worker.redis.sets)
+
+
+def test_spread_final_blocks_when_leg_quote_is_stale():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    worker._log = lambda *args, **kwargs: None
+    stale_quote = {
+        "option_mid": 0.575,
+        "option_bid": 0.55,
+        "option_ask": 0.60,
+        "quote_ts": "2026-05-05T13:55:00Z",
+        "quote_age_ms": 10_000,
+        "tradability_bucket": "tradable",
+    }
+    candidate = {
+        "structure": "credit_spread",
+        "spread_type": "put_credit",
+        "right": "P",
+        "short_raw_symbol": "SPY260505P00715000",
+        "long_raw_symbol": "SPY260505P00710000",
+        "short_strike": 715.0,
+        "long_strike": 710.0,
+        "expiry_date": "2026-05-05",
+        "net_credit": 0.35,
+        "strike_width": 5.0,
+        "max_loss": 4.65,
+        "max_loss_assumption": "AT_EXPIRATION_NO_ASSIGNMENT",
+        "legs": [
+            {
+                "raw_symbol": "SPY260505P00715000",
+                "action": "SELL",
+                "ratio": -1,
+                "side": "P",
+                "strike": 715.0,
+                "expiry_date": "2026-05-05",
+                "quote": stale_quote,
+            },
+            {
+                "raw_symbol": "SPY260505P00710000",
+                "action": "BUY",
+                "ratio": 1,
+                "side": "P",
+                "strike": 710.0,
+                "expiry_date": "2026-05-05",
+                "quote": stale_quote,
+            },
+        ],
+    }
+
+    asyncio.run(worker._publish_spread_final(
+        "etf_put_credit_open30_spread",
+        "SPY",
+        "BULLISH",
+        1.0,
+        datetime(2026, 5, 5).date(),
+        nw.DECISION_SLOTS[0],
+        candidate,
+    ))
+
+    assert not any(key.startswith("nexus_spread_overlay:") for key, _ in worker.redis.sets)
+    block = json.loads(worker.redis.values["nexus_final_block:SPY:etf_put_credit_open30_spread:10:00"])
+    assert block["decision"] == "FINAL_BLOCKED"
+    assert block["reason"] == "strategy_spread_final_blocked_by_quote"
+    assert worker.redis.publishes[-1][0] == "signal:final_block:etf_put_credit_open30_spread"
 
 
 def test_spread_open30_rejects_high_iv_rank():
@@ -1351,6 +1616,51 @@ def test_enrich_trade_payload_uses_equity_context_and_contract_tradability():
     assert enriched["_feature_status"]["underlying_mid"] == "available"
     assert enriched["_feature_status"]["option_mid"] == "available"
     assert enriched["_feature_status"]["delta"] == "missing"
+
+
+def test_enrich_trade_payload_uses_compact_contract_key_for_padded_raw_symbol():
+    raw_symbol = "SPY   260505C00700000"
+    redis = FakeRedis({
+        "equity:live:context:SPY": json.dumps({
+            "price": 700.25,
+            "lastPriceUtc": "2026-05-05T14:00:00Z",
+            "warmupComplete": True,
+            "priceDataStale": False,
+        }),
+        "options:live:contract_state:SPY260505C00700000": json.dumps({
+            "symbol": "SPY",
+            "rawSymbol": "SPY260505C00700000",
+            "asOfUtc": "2026-05-05T14:00:00Z",
+            "optionMid": 1.24,
+            "bid": 1.20,
+            "ask": 1.28,
+            "tradable": True,
+            "executable": True,
+            "tradabilityBucket": "tradable",
+            "delta": 0.52,
+            "gamma": 0.018,
+            "greeksTsUtc": "2026-05-05T14:00:00Z",
+        }),
+    })
+    payload = nw.normalize_trade_payload({
+        "symbol": "SPY",
+        "raw_symbol": raw_symbol,
+        "ts_utc": "2026-05-05T14:00:00Z",
+        "side": "C",
+        "price": 1.25,
+        "size": 10,
+        "premium": 1_250.0,
+        "is_sweep": True,
+        "aggressor": "A",
+    })
+
+    enriched = asyncio.run(nw.enrich_trade_payload_from_redis(payload, redis))
+
+    assert enriched["option_mid"] == 1.24
+    assert enriched["delta"] == 0.52
+    assert enriched["gamma"] == 0.018
+    assert enriched["_feature_status"]["option_mid"] == "available"
+    assert enriched["_feature_status"]["delta"] == "available"
 
 
 def test_normalize_trade_payload_derives_aggressor_and_sweep_from_fresh_quote():
@@ -1883,7 +2193,7 @@ def test_evaluate_strategy_publishes_window_views_even_when_trade_locked():
 
     asyncio.run(worker.evaluate_strategy("SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5, 14, 5, tzinfo=timezone.utc)))
 
-    decisions = [json.loads(value)["decision"] for _, value in worker.redis.sets]
+    decisions = [json.loads(value)["decision"] for key, value in worker.redis.sets if key != nw.NEXUS_HEALTH_KEY]
     assert "WINDOW_VIEW" in decisions
     assert "BET" not in decisions
 
@@ -2004,7 +2314,7 @@ def test_confluence_group_lock_blocks_other_symbol_confluence_only():
     assert not worker.already_signaled(session_date, "SPY", "etf_open_specialist")
 
 
-def test_context_falls_back_to_live_option_keys_when_stats_keys_are_absent():
+def test_context_requires_canonical_vrp_iv_rank():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.redis = FakeRedis({
         "options:live:iv_surface:SPY": json.dumps({"atmIv": 0.22}),
@@ -2012,12 +2322,12 @@ def test_context_falls_back_to_live_option_keys_when_stats_keys_are_absent():
         "options:live:vrp:SPY": json.dumps({"vrpRegime": "cheap"}),
     })
 
-    assert asyncio.run(worker.get_context("SPY")) == (20.0, 0.22, -1_500_000_000.0)
+    assert asyncio.run(worker.get_context("SPY")) == (50.0, 0.22, -1_500_000_000.0)
 
 
 def test_momentum_specialist_requires_underlying_mid_and_uses_iv_gate():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
-    worker.redis = FakeRedis({"options:live:vrp:SPY": json.dumps({"vrpRegime": "cheap"})})
+    worker.redis = FakeRedis({"options:live:vrp:SPY": json.dumps({"ivRank": 20})})
     rows = []
     for minute in range(10):
         rows.append({

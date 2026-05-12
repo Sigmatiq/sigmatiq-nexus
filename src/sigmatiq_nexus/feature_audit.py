@@ -25,7 +25,7 @@ class FeatureCheck:
 
     @property
     def degraded(self) -> bool:
-        return self.status == "fallback"
+        return False
 
 
 STRATEGY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
@@ -253,8 +253,7 @@ def _context_status(context: dict[str, Any], payload_key: str, feature: str) -> 
         if not feature_time and nw.NEXUS_REQUIRE_CONTEXT_TIMESTAMPS:
             return "unknown_freshness"
         reference_time = context.get("_reference_time")
-        status = nw._freshness_status(reference_time, feature_time, nw.FEATURE_MAX_AGE_SECONDS[feature], missing_is_stale=nw.NEXUS_REQUIRE_CONTEXT_TIMESTAMPS)
-        return "fallback" if status == "available" else status
+        return nw._freshness_status(reference_time, feature_time, nw.FEATURE_MAX_AGE_SECONDS[feature], missing_is_stale=nw.NEXUS_REQUIRE_CONTEXT_TIMESTAMPS)
     if nw.NEXUS_REQUIRE_CONTEXT_TIMESTAMPS:
         return "unknown_freshness"
     return "available"
@@ -266,10 +265,10 @@ def audit_context_features(context: dict[str, Any] | None = None) -> dict[str, F
 
     if context.get("iv_rank") is not None:
         checks["iv_rank"] = FeatureCheck("iv_rank", _context_status(context, "_iv_rank_payload", "iv_rank"), "iv_rank")
-    elif context.get("vrp_regime") is not None or context.get("ivRank") is not None:
-        checks["iv_rank"] = FeatureCheck("iv_rank", _context_status(context, "_vrp_payload", "iv_rank"), "vrp", "derived from VRP regime or ivRank")
+    elif context.get("ivRank") is not None:
+        checks["iv_rank"] = FeatureCheck("iv_rank", _context_status(context, "_vrp_payload", "iv_rank"), "vrp")
     else:
-        checks["iv_rank"] = FeatureCheck("iv_rank", "missing", reason="missing IV rank or VRP fallback")
+        checks["iv_rank"] = FeatureCheck("iv_rank", "missing", reason="missing canonical IV rank")
 
     if context.get("atm_iv") is not None or context.get("atmIv") is not None:
         checks["atm_iv"] = FeatureCheck("atm_iv", _context_status(context, "_iv_surface_payload", "atm_iv"), "iv_surface")
@@ -331,38 +330,18 @@ async def read_context(client: Any, symbol: str) -> dict[str, Any]:
     iv_surface_key = nw.IV_SURFACE_KEY_TEMPLATE.format(symbol=symbol)
     vrp_key = nw.VRP_KEY_TEMPLATE.format(symbol=symbol)
     gex_key = nw.GEX_KEY_TEMPLATE.format(symbol=symbol)
-    iv_rank_key = nw.IV_RANK_KEY_TEMPLATE.format(symbol=symbol)
-    atm_iv_key = nw.ATM_IV_KEY_TEMPLATE.format(symbol=symbol)
-    net_gex_key = nw.NET_GEX_KEY_TEMPLATE.format(symbol=symbol)
 
     iv_surface, vrp, gex = await asyncio.gather(
         _read_json_key(client, iv_surface_key),
         _read_json_key(client, vrp_key),
         _read_json_key(client, gex_key),
     )
-    iv_rank_raw, atm_iv_raw, net_gex_raw = await asyncio.gather(
-        client.get(iv_rank_key),
-        client.get(atm_iv_key),
-        client.get(net_gex_key),
-    )
     context: dict[str, Any] = {}
-    if iv_rank_raw:
-        context["iv_rank"] = float(iv_rank_raw)
-        context["_iv_rank_payload"] = {}
-    if atm_iv_raw:
-        context["atm_iv"] = float(atm_iv_raw)
-        context["_iv_surface_payload"] = {}
-    if net_gex_raw:
-        context["net_gex"] = float(net_gex_raw)
-        context["_gex_payload"] = {}
     if iv_surface.get("atmIv") is not None:
         context["atmIv"] = iv_surface["atmIv"]
         context["_iv_surface_payload"] = iv_surface
     if vrp.get("ivRank") is not None:
         context["ivRank"] = vrp["ivRank"]
-        context["_vrp_payload"] = vrp
-    if vrp.get("vrpRegime") is not None:
-        context["vrp_regime"] = vrp["vrpRegime"]
         context["_vrp_payload"] = vrp
     if gex.get("netGex") is not None:
         context["netGex"] = gex["netGex"]

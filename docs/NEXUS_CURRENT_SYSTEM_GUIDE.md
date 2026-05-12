@@ -7,7 +7,7 @@ This document describes implemented/current contracts unless a section is explic
 ## Current Posture
 
 - Nexus is a research and paper-signal engine, not a live auto-execution service.
-- The default live universe is controlled by `NEXUS_SYMBOLS`; current defaults are `SPY,QQQ` unless deployment config overrides them.
+- The default live universe is controlled by `NEXUS_SYMBOLS`; current defaults are `SPY,QQQ,IWM,UVXY` unless deployment config overrides them.
 - Morning strategy decisions are limited to researched completed windows from `09:30-12:00` ET.
 - Full-session context feeds continue every 30 minutes from `09:30-16:00` ET, plus optional `16:00-16:15`.
 - Nexus publishes deterministic facts, context, paper lifecycle events, and deterministic narratives. It should not publish user-directed trading instructions.
@@ -38,7 +38,7 @@ MCP and chat clients should call `sigmatiq-api` endpoints. They should not read 
 | IV surface | `options:live:iv_surface:{symbol}` | Vol context for strategy filters and market context. |
 | VRP | `options:live:vrp:{symbol}` | Vol pricing context for strategy filters. |
 | GEX | `options:live:gex:{symbol}` | Live gamma context for strategy and market-state filters. |
-| Optional scalar fallbacks | `stats:{symbol}:iv_rank`, `stats:{symbol}:atm_iv`, `stats:{symbol}:net_gex` | Legacy/context fallback only when configured and freshness rules allow it. |
+| Canonical live context only | `options:live:iv_surface:{symbol}`, `options:live:vrp:{symbol}`, `options:live:gex:{symbol}` | Strategy readiness uses the canonical live-worker payloads directly; legacy `stats:{symbol}:*` fallbacks are not accepted. |
 
 ## Published Nexus Messages
 
@@ -53,6 +53,7 @@ MCP and chat clients should call `sigmatiq-api` endpoints. They should not read 
 | `OPTION_MARKET_CONTEXT` | `nexus_option_market_context:{symbol}:{window_id}`, `nexus_option_market_context:{symbol}:latest` | `signal:option_market_context` | Full session, completed 30-minute windows | Broad option-market context: premium totals, most-traded contracts, cheap/costly contracts, liquidity quality, pricing quality, and late-event impact. | No |
 | `PARTICIPANT_FLOW_CONTEXT` | `nexus_participant_flow_context:{symbol}:{window_key}`, `nexus_participant_flow_context:{symbol}:latest` | `signal:participant_flow_context` | Full session, completed 30-minute windows | Trade-shape and participant-like flow context for the latest completed window. | No |
 | `LIQUIDATE` | `nexus_live_overlay:{symbol}` | `nexus_live_overlay:updates` | Active paper-position monitoring | Paper exit context for the exact tracked `raw_symbol`, with exit quote freshness and execution metadata. | Paper lifecycle only |
+| `HEALTH` | `health:nexus` | None | On input offset persistence, output publication, and error capture | Sidecar component health for `SPY`, `QQQ`, `IWM`, and `UVXY`: input offsets, output counts, blocked reasons, and last errors. | No |
 
 ### Message TTLs
 
