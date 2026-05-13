@@ -2358,6 +2358,28 @@ def test_momentum_specialist_requires_underlying_mid_and_uses_iv_gate():
     assert p_feat[:2] == [10.0, 0.0]
 
 
+def test_momentum_specialist_sorts_rows_before_dynamic_grouping():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({"options:live:vrp:IWM": json.dumps({"ivRank": 20})})
+    rows = []
+    for minute in range(10):
+        rows.append({
+            **row(f"2026-05-05T13:{30 + minute:02d}:30Z", "C", 25_000),
+            "symbol": "IWM",
+            "underlying_mid": 220.5 + minute,
+        })
+        rows.append({
+            **row(f"2026-05-05T13:{30 + minute:02d}:00Z", "C", 25_000),
+            "symbol": "IWM",
+            "underlying_mid": 220.0 + minute,
+        })
+
+    sentiment, valid, p_feat = asyncio.run(worker.check_momentum_heuristics(pl.DataFrame(list(reversed(rows))), "IWM"))
+
+    assert (sentiment, valid) == ("BULLISH", True)
+    assert p_feat[:2] == [10.0, 0.0]
+
+
 # ---------------------------------------------------------------------------
 # Participant Flow Context — integration tests
 # ---------------------------------------------------------------------------

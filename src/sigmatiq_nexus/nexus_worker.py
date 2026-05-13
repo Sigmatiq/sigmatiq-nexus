@@ -2915,7 +2915,7 @@ class SigmatiqNexus:
         if iv_rank >= 40:
             return None, False, None
         try:
-            bars = df.with_columns(pl.col("ts_utc").str.to_datetime(strict=False, time_zone="UTC")).group_by_dynamic("ts_utc", every="1m").agg([
+            bars = df.with_columns(pl.col("ts_utc").str.to_datetime(strict=False, time_zone="UTC")).sort("ts_utc").group_by_dynamic("ts_utc", every="1m").agg([
                 pl.col("underlying_mid").cast(pl.Float64, strict=False).first().alias("o"),
                 pl.col("underlying_mid").cast(pl.Float64, strict=False).last().alias("c"),
             ])
