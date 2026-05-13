@@ -801,8 +801,17 @@ def test_publish_final_appends_live_persistence_event():
 
     overlay_sets = [(key, value) for key, value in worker.redis.sets if key == "nexus_live_overlay:SPY"]
     assert len(overlay_sets) == 1
-    assert len(worker.redis.xadds) == 1
-    stream, fields, maxlen, approximate = worker.redis.xadds[0]
+    assert len(worker.redis.xadds) == 3
+    contract_refs = [fields for _, fields, _, _ in worker.redis.xadds if fields.get("source") == "sigmatiq_nexus_contract_reference"]
+    assert {fields["redis_key"] for fields in contract_refs} == {
+        "options:live:contract_state:SPY   260505C00720000",
+        "options:live:tradability:SPY   260505C00720000",
+    }
+    assert all(json.loads(fields["payload_json"])["symbol"] == "SPY" for fields in contract_refs)
+    assert all(json.loads(fields["payload_json"])["raw_symbol"] == "SPY   260505C00720000" for fields in contract_refs)
+    stream, fields, maxlen, approximate = next(
+        entry for entry in worker.redis.xadds if entry[1]["redis_key"] == "nexus_live_overlay:SPY"
+    )
     assert stream == "live:persistence:events"
     assert fields["redis_key"] == "nexus_live_overlay:SPY"
     payload = json.loads(fields["payload_json"])
@@ -1873,7 +1882,11 @@ def test_runtime_gate_allows_enriched_low_sweep_signal():
 
     overlay_sets = [(key, value) for key, value in worker.redis.sets if key == "nexus_live_overlay:SPY"]
     assert len(overlay_sets) == 1
-    assert len(worker.redis.xadds) == 2
+    assert len(worker.redis.xadds) == 3
+    contract_refs = [fields for _, fields, _, _ in worker.redis.xadds if fields.get("source") == "sigmatiq_nexus_contract_reference"]
+    assert [fields["redis_key"] for fields in contract_refs] == ["options:live:contract_state:SPY   260505C00700000"]
+    assert json.loads(contract_refs[0]["payload_json"])["symbol"] == "SPY"
+    assert json.loads(contract_refs[0]["payload_json"])["raw_symbol"] == "SPY   260505C00700000"
     assert worker.redis.sets[0][0] == "nexus_intermediate:SPY:etf_low_sweep_core:10:00"
     final = json.loads(overlay_sets[0][1])
     assert final["strategy"] == "etf_low_sweep_core"

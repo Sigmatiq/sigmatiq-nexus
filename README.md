@@ -10,7 +10,7 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
    - **Stage 1 (Heuristic):** Uses Polars to calculate Delta-Skew/Aggressor bias in microseconds.
    - **Stage 2 (AI):** Uses ONNX Runtime to validate trajectories with the RL Brain.
 3. **Decisions:** Publishes `BET` or `PASS` results to `signal:final:*` Redis channels.
-4. **Persistence:** Appends final/intermediate signal payloads to `live:persistence:events`; `Sigmatiq.Options.LivePersistenceWorker` stores them in `live.nexus_strategy_signal` for EOD review.
+4. **Persistence:** Appends final/intermediate/final-block payloads to `live:persistence:events`; `Sigmatiq.Options.LivePersistenceWorker` stores them in `live.nexus_strategy_signal` for EOD review.
 
 ## Live decision contract
 
@@ -32,6 +32,7 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - Nexus also publishes one per-window `WINDOW_PRICING` message per symbol/window with the cheapest contract, costliest contract, and cheap/costly side summary derived from pricing-lag inside that completed window.
 - Each strategy now has a fail-closed feature gate. If required live fields are missing, Nexus emits a stage `0` `BLOCKED` diagnostic on the same `nexus_window_view:{symbol}:{strategy}:{entry_label}` key family and skips the strategy instead of defaulting missing booleans/numbers.
 - Final `BET` payloads now carry the exact option `raw_symbol`, a live entry quote snapshot, quote freshness, quote-valid-until, and an explicit execution policy block. Runtime liquidation tracks that exact contract via `options:live:contract_state:{raw_symbol}` / `options:live:tradability:{raw_symbol}` instead of comparing against unrelated same-symbol option trades.
+- Completed-window and candidate quote lookups append `source=sigmatiq_nexus_contract_reference` persistence events for the exact `options:live:contract_state:{raw_symbol}` / `options:live:tradability:{raw_symbol}` keys Nexus used. The persistence worker stores only those referenced contracts, not the full raw option universe.
 - Single-leg final `BET` publishing fails closed when the exact contract has no fresh executable quote; the fresh quote reference becomes the recorded entry price.
 - Single-leg active positions are persisted to Redis and restored on worker startup for the current NY session.
 - Spread `BET` payloads are paper-only, publish to `nexus_spread_overlay:{symbol}:{strategy}:{entry_label}`, and are not attached to the current single-leg liquidation loop.

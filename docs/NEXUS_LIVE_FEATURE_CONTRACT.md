@@ -448,6 +448,8 @@ Cheap/costly contract and side reads are only emitted when Nexus has point-in-ti
   - Source scope: `NEXUS_HEALTH_SYMBOLS`, default `SPY,QQQ,IWM,UVXY`
   - Includes per-symbol input stream offsets, consumed counts, output family publish counts, blocked-message reason counts, and last worker errors
   - This is a sidecar monitoring contract; strategy and market-context consumers should continue to read the canonical Nexus message keys above
+  - Persistence: the live persistence worker stores this key in `live.pipeline_component_health`
+  - Contract-state persistence is event-gated: Nexus emits `source=sigmatiq_nexus_contract_reference` persistence events only for contract-state/tradability keys used by candidate/window evaluation, and the persistence worker rejects broad raw-contract persistence without that source marker
   - v1 does not attempt spread/structure heuristic detection
   - TTL: 48 hours for window keys, 8 hours for latest key
   - See `docs/NEXUS_PARTICIPANT_FLOW_CONTEXT_DESIGN.md` for full schema and labeling taxonomy

@@ -2012,6 +2012,7 @@ class SigmatiqNexus:
             exact_payload = {"symbol": symbol, "raw_symbol": tracked_raw_symbol}
             _merge_contract_payload(exact_payload, contract_state)
             _merge_contract_payload(exact_payload, tradability)
+            await self._append_contract_reference_events(symbol, tracked_raw_symbol, contract_state, tradability)
             return self._quote_from_payload(symbol, tracked_raw_symbol, exact_payload)
         return {}
 
@@ -2227,6 +2228,14 @@ class SigmatiqNexus:
         if raw_symbols:
             for raw_symbol, state, tradability in await asyncio.gather(*(contract_payloads(raw) for raw in raw_symbols)):
                 contract_map[raw_symbol] = (state, tradability)
+            await asyncio.gather(*(
+                self._append_contract_reference_events(symbol, raw_symbol, state, tradability)
+                for raw_symbol, state, tradability in (
+                    (raw_symbol, payloads[0], payloads[1])
+                    for raw_symbol, payloads in contract_map.items()
+                )
+                if state or tradability
+            ))
 
         enriched_rows = []
         for row in rows:
@@ -3304,12 +3313,44 @@ class SigmatiqNexus:
     async def _append_persistence_event(self, symbol, msg):
         await self._append_persistence_event_for_key(f"nexus_live_overlay:{symbol}", msg)
 
-    async def _append_persistence_event_for_key(self, redis_key: str, msg):
+    async def _append_contract_reference_events(
+        self,
+        symbol: str,
+        raw_symbol: str | None,
+        contract_state: dict | None,
+        tradability: dict | None,
+    ) -> None:
+        if not raw_symbol:
+            return
+
+        if contract_state:
+            contract_state_payload = dict(contract_state)
+            contract_state_payload.setdefault("symbol", symbol)
+            contract_state_payload.setdefault("raw_symbol", raw_symbol)
+            await self._append_persistence_event_for_key(
+                CONTRACT_STATE_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=raw_symbol),
+                contract_state_payload,
+                source="sigmatiq_nexus_contract_reference",
+            )
+        if tradability:
+            tradability_payload = dict(tradability)
+            tradability_payload.setdefault("symbol", symbol)
+            tradability_payload.setdefault("raw_symbol", raw_symbol)
+            await self._append_persistence_event_for_key(
+                CONTRACT_TRADABILITY_KEY_TEMPLATE.format(symbol=symbol, raw_symbol=raw_symbol),
+                tradability_payload,
+                source="sigmatiq_nexus_contract_reference",
+            )
+
+    async def _append_persistence_event_for_key(self, redis_key: str, msg, source: str | None = None):
         self._record_nexus_output(redis_key, msg if isinstance(msg, dict) else {})
         try:
+            fields = {"redis_key": redis_key, "payload_json": json.dumps(msg)}
+            if source:
+                fields["source"] = source
             await self.redis.xadd(
                 LIVE_PERSISTENCE_EVENT_STREAM,
-                {"redis_key": redis_key, "payload_json": json.dumps(msg)},
+                fields,
                 maxlen=10_000,
                 approximate=True,
             )
