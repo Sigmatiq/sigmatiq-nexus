@@ -115,6 +115,30 @@ def test_freshness_allows_context_newer_than_reference_time():
     assert nw._freshness_status(reference, feature_time, 120, missing_is_stale=True) == "available"
 
 
+def test_underlying_mid_bar_context_stays_available_within_two_minutes():
+    reference = datetime(2026, 5, 5, 14, 1, 30, tzinfo=timezone.utc)
+    payload = {
+        "underlying_mid": 700.25,
+        "underlying_ts_utc": "2026-05-05T14:00:00Z",
+        "underlying_warmup_complete": True,
+        "underlying_data_stale": False,
+    }
+
+    assert nw._event_freshness_status(payload, reference, "underlying_mid") == "available"
+
+
+def test_underlying_mid_bar_context_turns_stale_after_two_minutes():
+    reference = datetime(2026, 5, 5, 14, 2, 1, tzinfo=timezone.utc)
+    payload = {
+        "underlying_mid": 700.25,
+        "underlying_ts_utc": "2026-05-05T14:00:00Z",
+        "underlying_warmup_complete": True,
+        "underlying_data_stale": False,
+    }
+
+    assert nw._event_freshness_status(payload, reference, "underlying_mid") == "stale"
+
+
 def test_decode_msgpack_databento_trade_side_does_not_override_option_side():
     payload = {
         "underlying": "SPY",
@@ -1625,6 +1649,25 @@ def test_enrich_trade_payload_uses_equity_context_and_contract_tradability():
     assert enriched["_feature_status"]["underlying_mid"] == "available"
     assert enriched["_feature_status"]["option_mid"] == "available"
     assert enriched["_feature_status"]["delta"] == "missing"
+
+
+def test_normalize_trade_payload_keeps_missing_greeks_missing():
+    payload = nw.normalize_trade_payload({
+        "symbol": "SPY",
+        "raw_symbol": "SPY   260505C00700000",
+        "ts_utc": "2026-05-05T14:00:00Z",
+        "side": "C",
+        "price": 1.25,
+        "size": 10,
+        "premium": 1_250.0,
+        "is_sweep": True,
+        "aggressor": "A",
+    })
+
+    assert "delta" not in payload
+    assert "gamma" not in payload
+    assert payload["_feature_status"]["delta"] == "missing"
+    assert payload["_feature_status"]["gamma"] == "missing"
 
 
 def test_enrich_trade_payload_uses_compact_contract_key_for_padded_raw_symbol():

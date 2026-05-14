@@ -58,7 +58,7 @@ CONTRACT_TRADABILITY_KEY_TEMPLATE = os.environ.get("NEXUS_CONTRACT_TRADABILITY_K
 NEXUS_REQUIRE_CONTEXT_TIMESTAMPS = os.environ.get("NEXUS_REQUIRE_CONTEXT_TIMESTAMPS", "true").strip().lower() == "true"
 VOL_CONTEXT_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_VOL_CONTEXT_MAX_AGE_SECONDS", "120"))
 GEX_CONTEXT_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_GEX_CONTEXT_MAX_AGE_SECONDS", "120"))
-UNDERLYING_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_UNDERLYING_MAX_AGE_SECONDS", "5"))
+UNDERLYING_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_UNDERLYING_MAX_AGE_SECONDS", "120"))
 OPTION_QUOTE_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_OPTION_QUOTE_MAX_AGE_SECONDS", "5"))
 GREEK_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_GREEK_MAX_AGE_SECONDS", "60"))
 PRICING_LAG_MIN_BASELINE_SECONDS = int(os.environ.get("NEXUS_PRICING_LAG_MIN_BASELINE_SECONDS", "300"))
@@ -811,9 +811,11 @@ def normalize_trade_payload(payload: dict) -> dict:
         "premium": float(payload.get("premium") or price * size * 100.0),
         "is_sweep": is_sweep,
         "aggressor": aggressor,
-        "delta": float(payload.get("delta") or 0.0),
-        "gamma": float(payload.get("gamma") or 0.0),
     }
+    for greek in ("delta", "gamma"):
+        value = _payload_float(payload, greek, greek.capitalize())
+        if value is not None:
+            normalized[greek] = value
     for target, aliases in {
         "underlying_mid": ("underlying_mid", "underlyingMid", "underlying_price", "underlyingPrice"),
         "option_mid": ("option_mid", "optionMid"),

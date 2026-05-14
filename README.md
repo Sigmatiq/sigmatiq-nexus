@@ -70,7 +70,7 @@ Nexus publishes a market-context feed separate from strategy signals. Strategy d
 - `NEXUS_REQUIRE_CONTEXT_TIMESTAMPS`: default `true`; timestamp-less scalar context keys are blocked for live strategy decisions.
 - `NEXUS_VOL_CONTEXT_MAX_AGE_SECONDS`: max IV/VRP context age, default `120`.
 - `NEXUS_GEX_CONTEXT_MAX_AGE_SECONDS`: max GEX context age, default `120`.
-- `NEXUS_UNDERLYING_MAX_AGE_SECONDS`: max underlying state age on enriched events, default `5`.
+- `NEXUS_UNDERLYING_MAX_AGE_SECONDS`: max underlying state age on enriched events, default `120`. This matches the equity live-context freshness model, which is published from the 1-minute equity context stream rather than tick-by-tick quote updates.
 - `NEXUS_OPTION_QUOTE_MAX_AGE_SECONDS`: max option quote/mid age on enriched events, default `5`.
 - `NEXUS_GREEK_MAX_AGE_SECONDS`: max Greek age on enriched events, default `60`.
 - `NEXUS_SWEEP_PREMIUM_USD`: quote-derived sweep threshold when raw `is_sweep` is absent, default `25000`.
@@ -114,6 +114,7 @@ At runtime Nexus enriches raw option trade events from:
 - `options:live:tradability:{raw_symbol}` for option bid/ask/mid, quote timestamp, spread, and executable/tradability flags.
 - `options:live:contract_state:{raw_symbol}` for option mid, quote quality, tradability flags, underlying spot, and Greeks.
 - If raw trades omit `aggressor` or `is_sweep`, Nexus derives them only from fresh quote state; stale or untradable quotes still block the relevant strategy.
+- If raw trades omit `delta` / `gamma`, Nexus leaves those features missing until live contract state provides them; it does not synthesize `0.0` greeks.
 
 ## Operational logging
 
