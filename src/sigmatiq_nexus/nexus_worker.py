@@ -217,8 +217,6 @@ STRATEGY_REQUIRED_FEATURES = {
         "raw_symbol",
         "side",
         "premium",
-        "delta",
-        "option_mid",
         "iv_rank",
     ),
     "etf_call_credit_open30_spread": (
@@ -227,11 +225,19 @@ STRATEGY_REQUIRED_FEATURES = {
         "raw_symbol",
         "side",
         "premium",
-        "delta",
-        "option_mid",
         "iv_rank",
     ),
     "etf_allday_specialist": ("ts_utc", "symbol", "side", "premium"),
+}
+WINDOW_VIEW_APPLICABILITY = {
+    "etf_put_credit_open30_spread": {
+        "symbols": {"SPY", "QQQ"},
+        "entry_labels": {"10:00"},
+    },
+    "etf_call_credit_open30_spread": {
+        "symbols": {"SPY"},
+        "entry_labels": {"10:00"},
+    },
 }
 
 
@@ -248,6 +254,14 @@ def parse_event_datetime(payload: dict) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def strategy_window_view_applicable(strategy: str, symbol: str, slot: dict) -> bool:
+    rules = WINDOW_VIEW_APPLICABILITY.get(strategy)
+    if not rules:
+        return True
+    entry_label = slot.get("entry_label")
+    return symbol in rules["symbols"] and entry_label in rules["entry_labels"]
 
 
 def parse_optional_datetime(value) -> datetime | None:
@@ -2073,19 +2087,46 @@ class SigmatiqNexus:
         return execution["quote_freshness"] in FRESH_STATUSES and execution["reference_price"] is not None
 
     async def _spread_candidate(self, df: pl.DataFrame, symbol: str, right: str) -> dict | None:
-        if df.is_empty() or not {"raw_symbol", "side", "delta"}.issubset(set(df.columns)):
+        if df.is_empty() or not {"raw_symbol", "side"}.issubset(set(df.columns)):
             return None
         side_df = df.filter(pl.col("side").cast(pl.Utf8).str.to_uppercase() == right)
         if side_df.is_empty():
             return None
+        raw_symbols = sorted({
+            normalize_raw_symbol(row.get("raw_symbol") or row.get("rawSymbol"))
+            for row in side_df.to_dicts()
+            if normalize_raw_symbol(row.get("raw_symbol") or row.get("rawSymbol"))
+        })
+        contract_map: dict[str, tuple[dict, dict]] = {}
+        if raw_symbols and self.redis:
+            async def contract_payloads(raw_symbol: str) -> tuple[str, dict, dict]:
+                state, tradability = await _read_contract_payloads(self.redis, symbol, raw_symbol)
+                return raw_symbol, state, tradability
+
+            for raw_symbol, state, tradability in await asyncio.gather(*(contract_payloads(raw) for raw in raw_symbols)):
+                contract_map[raw_symbol] = (state, tradability)
+                if state or tradability:
+                    await self._append_contract_reference_events(symbol, raw_symbol, state, tradability)
         candidates = []
         for row in side_df.to_dicts():
             raw_symbol = str(row.get("raw_symbol") or "").replace(" ", "").upper()
             details = _contract_details_from_raw_symbol(raw_symbol)
             if details["strike"] is None or details["side"] != right:
                 continue
+            delta_value = row.get("delta")
+            if delta_value in (None, ""):
+                state, tradability = contract_map.get(raw_symbol, ({}, {}))
+                delta_value = _payload_float(state, "delta", "Delta")
+                if delta_value is None:
+                    delta_value = _payload_float(_nested_payload(state, "greeks", "Greeks"), "delta", "Delta")
+                if delta_value is None:
+                    delta_value = _payload_float(tradability, "delta", "Delta")
+                if delta_value is None:
+                    delta_value = _payload_float(_nested_payload(tradability, "greeks", "Greeks"), "delta", "Delta")
             try:
-                delta_distance = abs(abs(float(row.get("delta") or 0.0)) - SPREAD_TARGET_DELTA)
+                if delta_value in (None, ""):
+                    continue
+                delta_distance = abs(abs(float(delta_value)) - SPREAD_TARGET_DELTA)
                 premium = float(row.get("premium") or 0.0)
             except (TypeError, ValueError):
                 continue
@@ -2660,6 +2701,8 @@ class SigmatiqNexus:
             ("etf_call_credit_open30_spread", self.assess_call_credit_open30_spread),
         ]
         for strategy, assessor in strategies:
+            if not strategy_window_view_applicable(strategy, symbol, slot):
+                continue
             failures = await self._strategy_feature_failures(strategy, symbol, df, reference_time)
             if failures:
                 await self._publish_feature_block(strategy, symbol, slot, session_date, failures)

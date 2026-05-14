@@ -1328,6 +1328,60 @@ def test_put_credit_open30_spread_publishes_paper_bet():
     assert worker.redis.publishes[-1][0] == "signal:spread:etf_put_credit_open30_spread"
 
 
+def test_put_credit_open30_spread_uses_live_contract_state_when_window_rows_lack_delta_and_option_mid():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.signaled_today = set()
+    worker.active_positions = {}
+    worker.redis = FakeRedis({
+        "options:live:vrp:SPY": json.dumps({"ivRank": 20, "asOf": "2026-05-05T14:00:00Z"}),
+        "options:live:contract_state:SPY260505P00715000": json.dumps({
+            "optionMid": 0.575,
+            "bid": 0.55,
+            "ask": 0.60,
+            "delta": -0.16,
+            "asOfUtc": "2026-05-05T14:00:00Z",
+            "quoteAgeMs": 500,
+            "tradable": True,
+            "executable": True,
+            "tradabilityBucket": "tradable",
+        }),
+        "options:live:contract_state:SPY260505P00710000": json.dumps({
+            "optionMid": 0.175,
+            "bid": 0.15,
+            "ask": 0.20,
+            "delta": -0.10,
+            "asOfUtc": "2026-05-05T14:00:00Z",
+            "quoteAgeMs": 500,
+            "tradable": True,
+            "executable": True,
+            "tradabilityBucket": "tradable",
+        }),
+    })
+    df = pl.DataFrame([
+        {
+            **row("2026-05-05T13:35:00Z", "C", 250_000),
+            "raw_symbol": "SPY   260505C00725000",
+        },
+        {
+            **row("2026-05-05T13:50:00Z", "P", 20_000),
+            "raw_symbol": "SPY   260505P00715000",
+        },
+    ])
+
+    asyncio.run(worker.evaluate_put_credit_open30_spread(df, "SPY", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
+
+    spread_payloads = [
+        json.loads(value)
+        for key, value in worker.redis.sets
+        if key == "nexus_spread_overlay:SPY:etf_put_credit_open30_spread:10:00"
+    ]
+    assert len(spread_payloads) == 1
+    payload = spread_payloads[0]
+    assert payload["decision"] == "BET"
+    assert payload["spread"]["spread_type"] == "put_credit"
+    assert payload["entry_credit"] == 0.35
+
+
 def test_call_credit_open30_spread_is_spy_only_and_publishes():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
@@ -2382,6 +2436,82 @@ def test_evaluate_strategy_publishes_window_views_even_when_trade_locked():
     assert "BET" not in decisions
 
 
+def test_publish_window_assessments_skips_spread_window_views_for_unsupported_symbol_and_window():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:vrp:IWM": json.dumps({"ivRank": 20, "asOf": "2026-05-05T14:05:00Z"}),
+        "options:live:iv_surface:IWM": json.dumps({"atmIv": 0.22, "asOf": "2026-05-05T14:05:00Z"}),
+        "options:live:gex:IWM": json.dumps({"netGex": 1_000_000, "asOf": "2026-05-05T14:05:00Z"}),
+    })
+    worker.window_views_reported = set()
+    worker.feature_blocks_reported = set()
+    worker._log = lambda *args, **kwargs: None
+    df = pl.DataFrame([
+        nw.normalize_trade_payload({
+            "symbol": "IWM",
+            "raw_symbol": "IWM   260505C00220000",
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "side": "C",
+            "price": 2.0,
+            "size": 1000,
+            "premium": 200_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": 0.50,
+            "gamma": 0.01,
+            "greeks_ts_utc": "2026-05-05T13:35:00Z",
+            "underlying_mid": 220.0,
+            "underlying_ts_utc": "2026-05-05T13:35:00Z",
+            "option_mid": 2.0,
+            "quote_age_ms": 100,
+        })
+    ])
+
+    asyncio.run(worker.publish_window_assessments(df, "IWM", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
+
+    keys = [key for key, _ in worker.redis.sets]
+    assert "nexus_window_view:IWM:etf_put_credit_open30_spread:10:00" not in keys
+    assert "nexus_window_view:IWM:etf_call_credit_open30_spread:10:00" not in keys
+
+
+def test_publish_window_assessments_skips_spread_window_views_outside_open30_slot():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:vrp:SPY": json.dumps({"ivRank": 20, "asOf": "2026-05-05T14:35:00Z"}),
+        "options:live:iv_surface:SPY": json.dumps({"atmIv": 0.22, "asOf": "2026-05-05T14:35:00Z"}),
+        "options:live:gex:SPY": json.dumps({"netGex": 1_000_000, "asOf": "2026-05-05T14:35:00Z"}),
+    })
+    worker.window_views_reported = set()
+    worker.feature_blocks_reported = set()
+    worker._log = lambda *args, **kwargs: None
+    df = pl.DataFrame([
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00700000",
+            "ts_utc": "2026-05-05T14:05:00Z",
+            "side": "C",
+            "price": 2.0,
+            "size": 1000,
+            "premium": 200_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": 0.50,
+            "gamma": 0.01,
+            "greeks_ts_utc": "2026-05-05T14:05:00Z",
+            "underlying_mid": 700.0,
+            "underlying_ts_utc": "2026-05-05T14:05:00Z",
+            "option_mid": 2.0,
+            "quote_age_ms": 100,
+        })
+    ])
+
+    asyncio.run(worker.publish_window_assessments(df, "SPY", nw.DECISION_SLOTS[1], datetime(2026, 5, 5).date()))
+
+    keys = [key for key, _ in worker.redis.sets]
+    assert "nexus_window_view:SPY:etf_put_credit_open30_spread:10:30" not in keys
+    assert "nexus_window_view:SPY:etf_call_credit_open30_spread:10:30" not in keys
+
+
 def test_default_first_trigger_scope_prevents_second_strategy_final_publish():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.signaled_today = set()
@@ -2608,6 +2738,7 @@ def test_publish_participant_flow_context_sets_keys_and_publishes():
     assert msg["symbol"] == "SPY"
     assert msg["window_key"] == slot["entry_label"]
     assert msg["source"] == "sigmatiq_nexus"
+    assert msg["window_side_read"]["dominant_side"] == "calls"
     assert msg["window_side_read"]["premium_bias"] in ("call_heavy", "put_heavy", "balanced")
     assert msg["dealer_inferred_pressure"]["underlying_hedge_direction"] == "unknown"
     assert msg["data_quality"]["status"] in ("usable", "degraded", "thin", "stale", "unknown")

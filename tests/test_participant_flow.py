@@ -153,6 +153,7 @@ class TestAggregateWindow:
             _row(premium=50_000, side="P", aggressor="A", raw_symbol="SPY   260508P00555000", delta=-0.40),
         ]
         result = pf.aggregate_participant_flow_window(_make_df(rows), CONFIG)
+        assert result["window_side_read"]["dominant_side"] == "calls"
         assert result["window_side_read"]["premium_bias"] == "call_heavy"
         assert result["window_side_read"]["directional_read"] == "bullish"
 
@@ -165,6 +166,7 @@ class TestAggregateWindow:
         result = pf.aggregate_participant_flow_window(_make_df(rows), CONFIG)
         wsr = result["window_side_read"]
         # Bid-side dominates total premium — directional read is unknown
+        assert wsr["dominant_side"] == "unknown"
         assert wsr["directional_read"] == "unknown"
         assert wsr["confidence"] == "low"
 
@@ -322,6 +324,7 @@ class TestBuildPayload:
         rows = [_row()]
         msg = pf.build_participant_flow_payload(_make_df(rows), "SPY", self._slot(), date(2026, 5, 8), CONFIG)
         assert "window_side_read" in msg
+        assert "dominant_side" in msg["window_side_read"]
         assert "retail_like_flow" in msg
         assert "institutional_like_flow" in msg
         assert "dealer_inferred_pressure" in msg

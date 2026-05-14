@@ -359,7 +359,21 @@ def aggregate_participant_flow_window(
         wsr_codes.append("ASK_SIDE_PUT_LARGE_PRINTS")
         wsr_why.append({"code": "ASK_SIDE_PUT_LARGE_PRINTS", "text": "Ask-side put flow dominated aggressive prints"})
 
+    if aggressor_coverage < 0.5 or bid_dominant_window:
+        dominant_side = "unknown"
+    elif aggressor_bias == "ask_side_call_heavy":
+        dominant_side = "calls"
+    elif aggressor_bias == "ask_side_put_heavy":
+        dominant_side = "puts"
+    elif premium_bias == "call_heavy":
+        dominant_side = "calls"
+    elif premium_bias == "put_heavy":
+        dominant_side = "puts"
+    else:
+        dominant_side = "balanced"
+
     window_side_read = {
+        "dominant_side": dominant_side,
         "premium_bias": premium_bias,
         "aggressor_bias": aggressor_bias,
         "directional_read": directional_read,
@@ -487,6 +501,7 @@ def aggregate_participant_flow_window(
 def _empty_aggregation() -> dict:
     return {
         "window_side_read": {
+            "dominant_side": "balanced",
             "premium_bias": "balanced", "aggressor_bias": "balanced",
             "directional_read": "unknown", "confidence": "low",
             "call_premium": 0, "put_premium": 0, "reason_codes": [], "why": [],

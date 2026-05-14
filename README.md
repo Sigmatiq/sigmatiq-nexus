@@ -26,8 +26,11 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - `etf_confluence_sniper` is evaluated first for each eligible window.
 - `etf_open_specialist` is the explicit 10:00 ET cheap-call rule for the completed 09:30-10:00 window.
 - `etf_open_specialist` `WINDOW_VIEW` payloads persist the actual decision evidence used for that read: `iv_rank`, total/call/put premium, premium shares, put-call ratio, dominant side, and the gating thresholds.
+- `PARTICIPANT_FLOW_CONTEXT` payloads persist `window_side_read.dominant_side` alongside `directional_read` and `confidence`, and the persistence worker projects that field into `live.nexus_participant_flow_context.dominant_side`.
 - `etf_put_credit_open30_spread` is the paper-only 10:00 ET vertical put-credit spread read for SPY/QQQ when open30 call premium dominates and a same-expiry spread can be quoted at the minimum credit.
 - `etf_call_credit_open30_spread` is the paper-only 10:00 ET vertical call-credit spread read for SPY only when open30 put premium dominates and a same-expiry spread can be quoted at the minimum credit.
+- Spread open30 readiness is gated on completed-window trade identity plus fresh `iv_rank`; per-contract `delta` and executable quotes are resolved later during spread candidate selection from live contract-state keys, rather than forcing the raw window rows to already carry those fields.
+- Spread `WINDOW_VIEW` rows are only published where the strategy is actually applicable: `put_credit_open30` for `SPY` and `QQQ` at `10:00`, and `call_credit_open30` for `SPY` at `10:00`. Unsupported symbols or later windows are skipped instead of being emitted as synthetic `CHOP`.
 - `etf_low_sweep_core` remains available as the tested low-sweep candidate; `etf_flow_specialist` and `etf_momentum_specialist` are restricted to their researched 10:30 and 11:00 entry windows.
 - Every implemented strategy now publishes a per-window `WINDOW_VIEW` sentiment for every completed window from `09:30-12:00` ET, independent of whether that strategy is allowed to emit a trade candidate in that slot.
 - Nexus also publishes one per-window `WINDOW_PRICING` message per symbol/window with the cheapest contract, costliest contract, and cheap/costly side summary derived from pricing-lag inside that completed window.
