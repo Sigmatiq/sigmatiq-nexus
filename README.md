@@ -25,6 +25,7 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
 - Result: `SPY` and `QQQ` can each fire independently, while the group confluence lane still remains single-fire.
 - `etf_confluence_sniper` is evaluated first for each eligible window.
 - `etf_open_specialist` is the explicit 10:00 ET cheap-call rule for the completed 09:30-10:00 window.
+- `etf_open_specialist` `WINDOW_VIEW` payloads persist the actual decision evidence used for that read: `iv_rank`, total/call/put premium, premium shares, put-call ratio, dominant side, and the gating thresholds.
 - `etf_put_credit_open30_spread` is the paper-only 10:00 ET vertical put-credit spread read for SPY/QQQ when open30 call premium dominates and a same-expiry spread can be quoted at the minimum credit.
 - `etf_call_credit_open30_spread` is the paper-only 10:00 ET vertical call-credit spread read for SPY only when open30 put premium dominates and a same-expiry spread can be quoted at the minimum credit.
 - `etf_low_sweep_core` remains available as the tested low-sweep candidate; `etf_flow_specialist` and `etf_momentum_specialist` are restricted to their researched 10:30 and 11:00 entry windows.

@@ -83,6 +83,35 @@ def test_window_stats_normalizes_option_side_case():
     assert nw.dominant_side(stats) == "C"
 
 
+def test_assess_open_specialist_window_returns_decision_evidence():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+
+    async def fake_get_context(symbol):
+        assert symbol == "SPY"
+        return 22.0, 0.25, -1_500_000_000.0
+
+    worker.get_context = fake_get_context
+    df = pl.DataFrame([
+        row("2026-05-05T13:35:00Z", "C", 300_000),
+        row("2026-05-05T13:36:00Z", "P", 100_000),
+    ])
+
+    sentiment, reason, evidence = asyncio.run(worker.assess_open_specialist_window(df, "SPY", nw.DECISION_SLOTS[0]))
+
+    assert sentiment == "BULLISH"
+    assert reason == "call_dominance"
+    assert evidence["iv_rank"] == 22.0
+    assert evidence["total_premium"] == 400_000.0
+    assert evidence["call_premium"] == 300_000.0
+    assert evidence["put_premium"] == 100_000.0
+    assert evidence["call_premium_share"] == 0.75
+    assert evidence["put_premium_share"] == 0.25
+    assert evidence["premium_put_call_ratio"] == 100_000.0 / 300_000.0
+    assert evidence["dominant_side"] == "C"
+    assert evidence["min_window_premium_required"] == nw.MIN_WINDOW_PREMIUM
+    assert evidence["open_call_dominance_threshold"] == nw.OPEN_CALL_DOMINANCE
+
+
 def test_decode_msgpack_stream_entry_derives_live_trade_fields():
     payload = {
         "underlying": "SPY",
@@ -1051,6 +1080,55 @@ def test_publish_window_view_sets_key_and_appends_persistence_event():
     assert "lead_contract_cheapness_score" in payload
     assert worker.redis.xadds[0][1]["redis_key"] == "nexus_window_view:SPY:etf_low_sweep_core:10:00"
     assert worker.redis.publishes[0][0] == "signal:window_view:etf_low_sweep_core"
+
+
+def test_publish_window_view_includes_open_specialist_evidence():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    worker.window_views_reported = set()
+    worker._current_window_df = pl.DataFrame([
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00720000",
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "side": "C",
+            "price": 12.5,
+            "size": 300,
+            "premium": 375_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": 0.5,
+            "gamma": 0.01,
+            "underlying_mid": 720.0,
+            "option_mid": 12.5,
+        }),
+    ])
+    worker._current_window_pricing_summary = worker._window_pricing_summary(worker._current_window_df)
+
+    asyncio.run(worker._publish_window_view(
+        "etf_open_specialist",
+        "SPY",
+        "CHOP",
+        "cheap_vol_or_premium_filter_not_met",
+        nw.DECISION_SLOTS[0],
+        datetime(2026, 5, 5).date(),
+        evidence={
+            "iv_rank": 42.0,
+            "total_premium": 375_000.0,
+            "call_premium_share": 1.0,
+            "put_premium_share": 0.0,
+            "premium_put_call_ratio": 0.0,
+            "dominant_side": "C",
+        },
+    ))
+
+    payload = json.loads(worker.redis.sets[0][1])
+    assert payload["iv_rank"] == 42.0
+    assert payload["total_premium"] == 375_000.0
+    assert payload["call_premium_share"] == 1.0
+    assert payload["put_premium_share"] == 0.0
+    assert payload["premium_put_call_ratio"] == 0.0
+    assert payload["dominant_side"] == "C"
 
 
 def test_publish_window_pricing_sets_key_and_side_summary():

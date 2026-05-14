@@ -2432,7 +2432,16 @@ class SigmatiqNexus:
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish(f"signal:window_view:{strategy}", json.dumps(msg))
 
-    async def _publish_window_view(self, strategy: str, symbol: str, sentiment: str, reason: str, slot: dict, session_date) -> None:
+    async def _publish_window_view(
+        self,
+        strategy: str,
+        symbol: str,
+        sentiment: str,
+        reason: str,
+        slot: dict,
+        session_date,
+        evidence: dict | None = None,
+    ) -> None:
         key = (str(session_date), symbol, strategy, slot["entry_label"])
         reported = getattr(self, "window_views_reported", set())
         if key in reported:
@@ -2463,6 +2472,8 @@ class SigmatiqNexus:
         msg["lead_contract_side"] = lead_contract["side"]
         msg["lead_contract_pricing_lag"] = lead_pricing["pricing_lag"] if lead_pricing else None
         msg["lead_contract_cheapness_score"] = lead_pricing["cheapness_score"] if lead_pricing else None
+        if evidence:
+            msg.update(evidence)
         msg.update(narratives.build_window_view_narrative(msg))
         redis_key = f"nexus_window_view:{symbol}:{strategy}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg))
@@ -2603,8 +2614,13 @@ class SigmatiqNexus:
             if failures:
                 await self._publish_feature_block(strategy, symbol, slot, session_date, failures)
                 continue
-            sentiment, reason = await assessor(df, symbol, slot)
-            await self._publish_window_view(strategy, symbol, sentiment, reason, slot, session_date)
+            result = await assessor(df, symbol, slot)
+            if isinstance(result, tuple) and len(result) == 3:
+                sentiment, reason, evidence = result
+            else:
+                sentiment, reason = result
+                evidence = None
+            await self._publish_window_view(strategy, symbol, sentiment, reason, slot, session_date, evidence=evidence)
         self._current_window_df = pl.DataFrame()
         self._current_window_pricing_summary = {}
 
@@ -2802,13 +2818,28 @@ class SigmatiqNexus:
     async def assess_open_specialist_window(self, df, symbol, slot: dict):
         iv_rank, _, _ = await self.get_context(symbol)
         stats = window_stats(df)
+        call_share = stats["call_p"] / stats["total_p"] if stats["total_p"] > 0 else 0.0
+        put_share = stats["put_p"] / stats["total_p"] if stats["total_p"] > 0 else 0.0
+        ratio = stats["put_p"] / stats["call_p"] if stats["call_p"] > 0 else None
+        evidence = {
+            "iv_rank": iv_rank,
+            "total_premium": stats["total_p"],
+            "call_premium": stats["call_p"],
+            "put_premium": stats["put_p"],
+            "call_premium_share": call_share,
+            "put_premium_share": put_share,
+            "premium_put_call_ratio": ratio,
+            "dominant_side": dominant_side(stats),
+            "min_window_premium_required": MIN_WINDOW_PREMIUM,
+            "open_call_dominance_threshold": OPEN_CALL_DOMINANCE,
+        }
         if iv_rank >= 30 or stats["total_p"] < MIN_WINDOW_PREMIUM:
-            return "CHOP", "cheap_vol_or_premium_filter_not_met"
+            return "CHOP", "cheap_vol_or_premium_filter_not_met", evidence
         if stats["call_p"] > stats["put_p"] * OPEN_CALL_DOMINANCE:
-            return "BULLISH", "call_dominance"
+            return "BULLISH", "call_dominance", evidence
         if stats["put_p"] > stats["call_p"] * OPEN_CALL_DOMINANCE:
-            return "BEARISH", "put_dominance"
-        return "CHOP", "no_open_dominance"
+            return "BEARISH", "put_dominance", evidence
+        return "CHOP", "no_open_dominance", evidence
 
     async def evaluate_low_sweep_core(self, df, symbol, slot: dict, session_date, reference_time: datetime | None = None):
         strategy = "etf_low_sweep_core"
