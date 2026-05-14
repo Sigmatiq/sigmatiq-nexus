@@ -10,7 +10,7 @@ The Nexus acts as a middle-tier between **Ingestion** and **Execution**.
    - **Stage 1 (Heuristic):** Uses Polars to calculate Delta-Skew/Aggressor bias in microseconds.
    - **Stage 2 (AI):** Uses ONNX Runtime to validate trajectories with the RL Brain.
 3. **Decisions:** Publishes `BET` or `PASS` results to `signal:final:*` Redis channels.
-4. **Persistence:** Appends final/intermediate/final-block payloads to `live:persistence:events`; `Sigmatiq.Options.LivePersistenceWorker` stores them in `live.nexus_strategy_signal` for EOD review.
+4. **Persistence:** Appends final/intermediate/final-block payloads to `live:persistence:events`; `Sigmatiq.Options.LivePersistenceWorker` stores them in `live.nexus_strategy_signal` for EOD review. All three lifecycle payloads now carry numeric `confidence` so the persisted `live.nexus_strategy_signal.confidence` column stays populated for stage-1 candidates, final bets, and final-blocked outcomes.
 
 ## Live decision contract
 

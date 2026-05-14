@@ -909,6 +909,7 @@ def test_publish_final_blocks_when_quote_is_missing():
     assert not worker.already_signaled(datetime(2026, 5, 5).date(), "SPY", "etf_low_sweep_core")
     block = json.loads(worker.redis.values["nexus_final_block:SPY:etf_low_sweep_core:10:00"])
     assert block["decision"] == "FINAL_BLOCKED"
+    assert block["confidence"] == 1.0
     assert block["reason"] == "strategy_final_blocked_by_quote"
     assert block["raw_symbol"] == "SPY   260505C00720000"
     assert worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "SPY", "final_block")] == {"etf_low_sweep_core:10:00"}
@@ -968,7 +969,7 @@ def test_publish_intermediate_sets_key_and_appends_persistence_event():
     worker.redis = FakeRedis()
 
     session_date = datetime(2026, 5, 5).date()
-    asyncio.run(worker._publish_intermediate("etf_low_sweep_core", "SPY", "BULLISH", nw.DECISION_SLOTS[0], session_date, "SPY   260505C00720000"))
+    asyncio.run(worker._publish_intermediate("etf_low_sweep_core", "SPY", "BULLISH", 0.91, nw.DECISION_SLOTS[0], session_date, "SPY   260505C00720000"))
 
     assert worker.redis.sets[0][0] == "nexus_intermediate:SPY:etf_low_sweep_core:10:00"
     payload = json.loads(worker.redis.sets[0][1])
@@ -976,6 +977,7 @@ def test_publish_intermediate_sets_key_and_appends_persistence_event():
     assert payload["stage"] == 1
     assert payload["decision"] == "INTERMEDIATE"
     assert payload["sentiment"] == "BULLISH"
+    assert payload["confidence"] == 0.91
     assert payload["signal_id"].startswith("sig_")
     assert payload["position_id"] == payload["signal_id"]
     assert payload["raw_symbol"] == "SPY   260505C00720000"
@@ -1515,6 +1517,7 @@ def test_spread_final_blocks_when_leg_quote_is_stale():
     assert not any(key.startswith("nexus_spread_overlay:") for key, _ in worker.redis.sets)
     block = json.loads(worker.redis.values["nexus_final_block:SPY:etf_put_credit_open30_spread:10:00"])
     assert block["decision"] == "FINAL_BLOCKED"
+    assert block["confidence"] == 1.0
     assert block["reason"] == "strategy_spread_final_blocked_by_quote"
     assert worker.redis.publishes[-1][0] == "signal:final_block:etf_put_credit_open30_spread"
 

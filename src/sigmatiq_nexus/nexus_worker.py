@@ -1810,7 +1810,7 @@ class SigmatiqNexus:
             "entry_label": f"allday_{ny_time.strftime('%H%M')}",
         }
 
-        await self._publish_intermediate(strategy, symbol, sentiment, alert_slot, session_date, lead_raw_symbol)
+        await self._publish_intermediate(strategy, symbol, sentiment, 0.80, alert_slot, session_date, lead_raw_symbol)
         await self._publish_final(strategy, symbol, sentiment, 0.80, price, session_date, alert_slot, lead_raw_symbol)
         self._log(
             "allday_alert_evaluated",
@@ -2745,7 +2745,7 @@ class SigmatiqNexus:
             self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="pricing_lag_not_cheap_enough", pricing_lag=pricing_lag, sentiment=sentiment, **self._window_log_fields(df, slot))
             return
         lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
-        await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date, lead_raw_symbol)
+        await self._publish_intermediate(strategy, symbol, sentiment, 1.0, slot, session_date, lead_raw_symbol)
         await self._publish_final(strategy, symbol, sentiment, 1.0, price, session_date, slot, lead_raw_symbol)
 
     async def assess_confluence_window(self, df, symbol, slot: dict):
@@ -2771,7 +2771,7 @@ class SigmatiqNexus:
         if not candidate:
             self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="no_valid_put_credit_spread_candidate", **self._window_log_fields(df, slot))
             return
-        await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date, candidate["short_raw_symbol"])
+        await self._publish_intermediate(strategy, symbol, sentiment, 1.0, slot, session_date, candidate["short_raw_symbol"])
         await self._publish_spread_final(strategy, symbol, sentiment, 1.0, session_date, slot, candidate)
 
     async def check_put_credit_open30_spread(self, df, symbol, slot: dict):
@@ -2805,7 +2805,7 @@ class SigmatiqNexus:
         if not candidate:
             self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="no_valid_call_credit_spread_candidate", **self._window_log_fields(df, slot))
             return
-        await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date, candidate["short_raw_symbol"])
+        await self._publish_intermediate(strategy, symbol, sentiment, 1.0, slot, session_date, candidate["short_raw_symbol"])
         await self._publish_spread_final(strategy, symbol, sentiment, 1.0, session_date, slot, candidate)
 
     async def check_call_credit_open30_spread(self, df, symbol, slot: dict):
@@ -2889,7 +2889,7 @@ class SigmatiqNexus:
         sentiment, valid = await self.check_open_specialist_heuristic(df, symbol, slot)
         if valid:
             lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
-            await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date, lead_raw_symbol)
+            await self._publish_intermediate(strategy, symbol, sentiment, 0.95, slot, session_date, lead_raw_symbol)
             await self._publish_final(strategy, symbol, sentiment, 0.95, price, session_date, slot, lead_raw_symbol)
         else:
             iv_rank, _, _ = await self.get_context(symbol)
@@ -2943,7 +2943,7 @@ class SigmatiqNexus:
         sentiment, valid = await self.calculate_low_sweep_heuristic(df, slot)
         if valid:
             lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
-            await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date, lead_raw_symbol)
+            await self._publish_intermediate(strategy, symbol, sentiment, 1.0, slot, session_date, lead_raw_symbol)
             await self._publish_final(strategy, symbol, sentiment, 1.0, price, session_date, slot, lead_raw_symbol)
         else:
             self._log("strategy_no_signal", strategy=strategy, symbol=symbol, session_date=str(session_date), reason="low_sweep_heuristic_not_met", **self._window_log_fields(df, slot))
@@ -2982,8 +2982,8 @@ class SigmatiqNexus:
             return
         sentiment, valid = await self.check_flow_heuristics(df, symbol, slot)
         if valid:
-            await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date)
             prob = await self.predict_v6(df, symbol)
+            await self._publish_intermediate(strategy, symbol, sentiment, prob, slot, session_date)
             if prob > 0.45:
                 lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
                 await self._publish_final(strategy, symbol, sentiment, prob, price, session_date, slot, lead_raw_symbol)
@@ -3019,8 +3019,8 @@ class SigmatiqNexus:
             return
         sentiment, valid, p_feat = await self.check_momentum_heuristics(df, symbol)
         if valid:
-            await self._publish_intermediate(strategy, symbol, sentiment, slot, session_date)
             prob = await self.predict_v10(df, symbol, p_feat)
+            await self._publish_intermediate(strategy, symbol, sentiment, prob, slot, session_date)
             if prob > 0.55:
                 lead_raw_symbol, price = self._get_lead_contract_quote(df, sentiment)
                 await self._publish_final(strategy, symbol, sentiment, prob, price, session_date, slot, lead_raw_symbol)
@@ -3092,7 +3092,7 @@ class SigmatiqNexus:
         exp_logits = np.exp(logits[0] - np.max(logits[0]))
         return float(exp_logits[1] / np.sum(exp_logits))
 
-    async def _publish_intermediate(self, strategy, symbol, sentiment, slot: dict | None = None, session_date=None, raw_symbol: str | None = None):
+    async def _publish_intermediate(self, strategy, symbol, sentiment, confidence: float, slot: dict | None = None, session_date=None, raw_symbol: str | None = None):
         signal_id = build_signal_id(strategy, symbol, session_date, slot, raw_symbol)
         msg = {
             "message_id": new_message_id(),
@@ -3103,6 +3103,7 @@ class SigmatiqNexus:
             "stage": 1,
             "decision": "INTERMEDIATE",
             "sentiment": sentiment,
+            "confidence": float(confidence),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "source": "sigmatiq_nexus",
         }
@@ -3124,7 +3125,7 @@ class SigmatiqNexus:
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish("nexus_intermediate:updates", symbol)
         await self._publish(f"signal:intermediate:{strategy}", json.dumps(msg))
-        self._log("strategy_intermediate_published", strategy=strategy, symbol=symbol, sentiment=sentiment, entry_time=slot["entry_label"] if slot else None)
+        self._log("strategy_intermediate_published", strategy=strategy, symbol=symbol, sentiment=sentiment, confidence=round(float(confidence), 4), entry_time=slot["entry_label"] if slot else None)
 
     async def _publish_final(self, strategy: str, symbol: str, sentiment: str, confidence: float, entry_price: float = 0.0, session_date=None, slot: dict | None = None, raw_symbol: str | None = None):
         # --- TOURNAMENT WHITELIST CHECK (Best Practical Combo) ---
@@ -3147,6 +3148,7 @@ class SigmatiqNexus:
                 "strategy_final_blocked_by_whitelist",
                 {"sentiment": sentiment},
                 raw_symbol,
+                confidence=confidence,
             )
             return
 
@@ -3175,6 +3177,7 @@ class SigmatiqNexus:
                 "strategy_final_blocked_by_quote",
                 {"execution": execution, "quote": quote},
                 raw_symbol,
+                confidence=confidence,
             )
             return
         entry_price = execution["reference_price"]
@@ -3189,6 +3192,7 @@ class SigmatiqNexus:
                 "strategy_final_blocked_by_lock",
                 {"signal_id": signal_id},
                 raw_symbol,
+                confidence=confidence,
             )
             return
         msg = {
@@ -3304,6 +3308,7 @@ class SigmatiqNexus:
                 "strategy_spread_final_blocked_by_quote",
                 {"executions": executions, "candidate": {k: v for k, v in candidate.items() if k != "legs"}},
                 raw_symbol,
+                confidence=confidence,
             )
             self._log(
                 "strategy_spread_final_blocked_by_quote",
@@ -3405,6 +3410,7 @@ class SigmatiqNexus:
         reason: str,
         details: dict | None = None,
         raw_symbol: str | None = None,
+        confidence: float | None = None,
     ):
         key_date = session_date or ny_session_date(datetime.now(timezone.utc))
         entry_label = slot["entry_label"] if slot else "na"
@@ -3416,6 +3422,7 @@ class SigmatiqNexus:
             "stage": 2,
             "decision": "FINAL_BLOCKED",
             "sentiment": sentiment,
+            "confidence": float(confidence) if confidence is not None else None,
             "reason": reason,
             "details": details or {},
             "raw_symbol": raw_symbol,
