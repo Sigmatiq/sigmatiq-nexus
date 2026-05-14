@@ -64,6 +64,9 @@ GREEK_MAX_AGE_SECONDS = int(os.environ.get("NEXUS_GREEK_MAX_AGE_SECONDS", "60"))
 PRICING_LAG_MIN_BASELINE_SECONDS = int(os.environ.get("NEXUS_PRICING_LAG_MIN_BASELINE_SECONDS", "300"))
 PRICING_LAG_MIN_PRICE_MOVE = float(os.environ.get("NEXUS_PRICING_LAG_MIN_PRICE_MOVE", "0.005"))
 PRICING_LAG_MIN_UNDERLYING_MOVE = float(os.environ.get("NEXUS_PRICING_LAG_MIN_UNDERLYING_MOVE", "0.005"))
+NEXUS_SCHEMA_VERSION = 1
+NEXUS_WORKER_NAME = os.environ.get("NEXUS_WORKER_NAME", "sigmatiq_nexus")
+NEXUS_WORKER_VERSION = os.environ.get("IMAGE_TAG") or os.environ.get("GIT_SHA") or "dev"
 AGGRESSOR_EDGE_PCT = float(os.environ.get("NEXUS_AGGRESSOR_EDGE_PCT", "0.20"))
 AGGRESSOR_MAX_SPREAD_PCT = float(os.environ.get("NEXUS_AGGRESSOR_MAX_SPREAD_PCT", "0.25"))
 SWEEP_PREMIUM_USD = float(os.environ.get("NEXUS_SWEEP_PREMIUM_USD", "25000"))
@@ -1494,8 +1497,48 @@ class SigmatiqNexus:
         if cheap_side == "unknown" and costly_side == "unknown" and stats["total_p"] > 0:
             cheap_side = "balanced"
             costly_side = "balanced"
+        missing = []
+        degraded = []
+        reason_codes = []
+        trade_count = int(df.height)
+        contract_count = len(contexts)
+        if trade_count == 0:
+            dq_status = "thin"
+            missing.append("trades")
+            reason_codes.append("NO_TRADES_IN_WINDOW")
+        elif contract_count == 0:
+            dq_status = "thin"
+            missing.append("contract_context")
+            reason_codes.append("NO_CONTRACT_CONTEXT")
+        elif pricing_quality == "usable" and liquidity_quality in ("good", "fair"):
+            dq_status = "usable"
+        elif pricing_quality == "degraded" or liquidity_quality == "poor":
+            dq_status = "degraded"
+        else:
+            dq_status = "unknown"
+
+        if pricing_quality == "unknown":
+            degraded.append("pricing_quality_unknown")
+            reason_codes.append("PRICING_QUALITY_UNKNOWN")
+            if pricing_summary.get("pricing_quality_reason") == "no_reliable_pricing_profiles":
+                missing.append("pricing_profiles")
+                reason_codes.append("NO_RELIABLE_PRICING_PROFILES")
+        elif pricing_quality == "degraded":
+            degraded.append("pricing_quality_degraded")
+            reason_codes.append("PRICING_QUALITY_DEGRADED")
+
+        if liquidity_quality == "poor":
+            degraded.append("liquidity_poor")
+            reason_codes.append("LIQUIDITY_POOR")
+        elif liquidity_quality == "unknown":
+            degraded.append("liquidity_unknown")
+            reason_codes.append("LIQUIDITY_UNKNOWN")
+
         late = self.late_window_impacts.get(window_eval_key(session_date, symbol, slot["entry_label"])) or {}
         payload = {
+            "schema_version": NEXUS_SCHEMA_VERSION,
+            "worker_name": NEXUS_WORKER_NAME,
+            "worker_version": NEXUS_WORKER_VERSION,
             "symbol": symbol,
             "window_id": slot["entry_label"],
             "window_start": slot["window_start"].isoformat(),
@@ -1517,11 +1560,18 @@ class SigmatiqNexus:
             "most_traded_contracts": most_traded,
             "cheapest_contracts": cheapest,
             "costliest_contracts": costliest,
+            "pricing_profile_count": len(profiles),
             "cheap_side": cheap_side,
             "costly_side": costly_side,
             "liquidity_quality": liquidity_quality,
             "pricing_quality": pricing_quality,
             "pricing_quality_reason": pricing_summary.get("pricing_quality_reason"),
+            "data_quality": {
+                "status": dq_status,
+                "missing": missing,
+                "degraded": degraded,
+                "reason_codes": reason_codes,
+            },
             "late_event_impact": {
                 "late_event_count": int(late.get("late_event_count") or 0),
                 "late_total_premium": round(float(late.get("late_total_premium") or 0.0), 2),

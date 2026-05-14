@@ -2174,17 +2174,67 @@ def test_publish_option_market_context_sets_latest_and_publishes():
     assert worker.redis.expires[key] == 48 * 3600
     assert worker.redis.expires["nexus_option_market_context:SPY:latest"] == 8 * 3600
     msg = json.loads(worker.redis.values[key])
+    assert msg["schema_version"] == nw.NEXUS_SCHEMA_VERSION
+    assert msg["worker_name"] == nw.NEXUS_WORKER_NAME
+    assert msg["worker_version"] == nw.NEXUS_WORKER_VERSION
     assert msg["window_id"] == "w0930_1000"
     assert msg["premium"]["net_premium_bias"] == "call_heavy"
     assert msg["activity"]["trade_count"] == 3
     assert msg["activity"]["contract_count"] == 2
+    assert msg["pricing_profile_count"] == 1
     assert msg["most_traded_contracts"][0]["raw_symbol"] == "SPY   260505C00700000"
     assert msg["cheap_side"] == "balanced"
     assert msg["pricing_quality"] == "degraded"
     assert msg["pricing_quality_reason"] == "pricing_lag_range_too_small"
+    assert msg["data_quality"]["status"] == "degraded"
+    assert "PRICING_QUALITY_DEGRADED" in msg["data_quality"]["reason_codes"]
+    assert "pricing_quality_degraded" in msg["data_quality"]["degraded"]
     assert worker.redis.xadds[0][1]["redis_key"] == key
     assert worker.redis.publishes[0][0] == "signal:option_market_context"
     assert ("2026-05-05", "SPY", "w0930_1000") in worker.option_market_context_reported
+
+
+def test_publish_option_market_context_marks_missing_pricing_profiles():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis()
+    worker.option_market_context_reported = set()
+    worker.late_window_impacts = {}
+    worker.buffers = {"SPY": deque(maxlen=10)}
+    rows = [
+        {
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00700000",
+            "side": "C",
+            "premium": 300_000.0,
+            "is_sweep": True,
+            "underlying_mid": 700.0,
+            "delta": 0.5,
+            "option_mid": 10.0,
+        },
+        {
+            "ts_utc": "2026-05-05T13:42:00Z",
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00700000",
+            "side": "C",
+            "premium": 150_000.0,
+            "is_sweep": False,
+            "underlying_mid": 702.0,
+            "delta": 0.5,
+            "option_mid": 10.7,
+        },
+    ]
+    worker.buffers["SPY"].extend(rows)
+
+    asyncio.run(worker.publish_option_market_context_for_slot("SPY", nw.MARKET_CONTEXT_WINDOWS[0], datetime(2026, 5, 5).date()))
+
+    msg = json.loads(worker.redis.values["nexus_option_market_context:SPY:w0930_1000"])
+    assert msg["pricing_profile_count"] == 0
+    assert msg["pricing_quality"] == "unknown"
+    assert msg["pricing_quality_reason"] == "no_reliable_pricing_profiles"
+    assert msg["data_quality"]["status"] == "unknown"
+    assert "pricing_profiles" in msg["data_quality"]["missing"]
+    assert "NO_RELIABLE_PRICING_PROFILES" in msg["data_quality"]["reason_codes"]
 
 
 def test_publish_option_market_context_does_not_mark_reported_when_write_fails():
