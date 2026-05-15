@@ -1218,7 +1218,7 @@ def test_publish_window_pricing_sets_key_and_side_summary():
     assert worker.redis.publishes[0][0] == "signal:window_pricing"
 
 
-def test_window_pricing_degrades_when_quotes_are_not_point_in_time():
+def test_window_pricing_uses_trade_baseline_with_later_live_quote_snapshot():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     df = pl.DataFrame([
         nw.normalize_trade_payload({
@@ -1232,15 +1232,43 @@ def test_window_pricing_degrades_when_quotes_are_not_point_in_time():
             "is_sweep": False,
             "aggressor": "A",
             "delta": 0.50,
-            "gamma": 0.01,
             "underlying_mid": 720.0,
-            "option_mid": 10.0,
+            "option_mid": 10.4,
             "quote_ts_utc": "2026-05-05T14:00:00Z",
         }),
         nw.normalize_trade_payload({
             "symbol": "SPY",
+            "raw_symbol": "SPY   260505P00700000",
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "side": "P",
+            "price": 8.0,
+            "size": 150,
+            "premium": 120_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": -0.45,
+            "underlying_mid": 721.5,
+            "option_mid": 7.4,
+            "quote_ts_utc": "2026-05-05T14:00:00Z",
+        }),
+    ])
+
+    summary = worker._window_pricing_summary(df)
+
+    assert summary["evaluated_contract_count"] == 2
+    assert summary["cheap_contract"] is not None
+    assert summary["costly_contract"] is not None
+    assert summary["pricing_quality"] == "usable"
+    assert summary["pricing_quality_reason"] == "point_in_time_pricing_profiles"
+
+
+def test_window_pricing_requires_current_quote_snapshot():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    df = pl.DataFrame([
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
             "raw_symbol": "SPY   260505C00720000",
-            "ts_utc": "2026-05-05T13:41:00Z",
+            "ts_utc": "2026-05-05T13:35:00Z",
             "side": "C",
             "price": 10.0,
             "size": 200,
@@ -1248,10 +1276,7 @@ def test_window_pricing_degrades_when_quotes_are_not_point_in_time():
             "is_sweep": False,
             "aggressor": "A",
             "delta": 0.50,
-            "gamma": 0.01,
             "underlying_mid": 720.0,
-            "option_mid": 10.0,
-            "quote_ts_utc": "2026-05-05T14:00:00Z",
         }),
     ])
 

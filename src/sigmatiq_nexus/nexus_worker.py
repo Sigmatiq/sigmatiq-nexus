@@ -1327,8 +1327,7 @@ class SigmatiqNexus:
         required = {"ts_utc", "raw_symbol", "underlying_mid", "delta"}
         if df.is_empty() or not required.issubset(set(df.columns)):
             return []
-        price_col = "option_mid" if "option_mid" in df.columns else "price" if "price" in df.columns else None
-        if price_col is None:
+        if "option_mid" not in df.columns:
             return []
         profiles: list[dict] = []
         for raw_symbol in df.select("raw_symbol").drop_nulls().unique()["raw_symbol"].to_list():
@@ -1338,35 +1337,41 @@ class SigmatiqNexus:
                 if "_dt_utc" in df.columns
                 else df.filter(pl.col("raw_symbol") == raw_symbol).sort("ts_utc")
             )
-            valid_rows = []
+            current_snapshots = []
             for row in hist.to_dicts():
                 event_ts = parse_optional_datetime(row.get("ts_utc"))
                 quote_ts = parse_optional_datetime(row.get("quote_ts_utc"))
-                if event_ts is None or quote_ts is None:
-                    continue
-                if abs((quote_ts - event_ts).total_seconds()) > OPTION_QUOTE_MAX_AGE_SECONDS:
+                if event_ts is None:
                     continue
                 try:
-                    p = float(row.get(price_col) or 0.0)
-                    s = float(row.get("underlying_mid") or 0.0)
-                    delta = float(row.get("delta") or 0.0)
+                    current_mid = float(row.get("option_mid") or 0.0)
+                    underlying_now = float(row.get("underlying_mid") or 0.0)
+                    delta_now = float(row.get("delta") or 0.0)
                 except (TypeError, ValueError):
                     continue
-                if p <= 0 or s <= 0:
+                trade_price = _payload_float(row, "price")
+                if trade_price in (None, 0.0) and quote_ts is not None and abs((quote_ts - event_ts).total_seconds()) <= OPTION_QUOTE_MAX_AGE_SECONDS:
+                    trade_price = _payload_float(row, "option_mid")
+                if trade_price is None:
+                    trade_price = 0.0
+                if trade_price <= 0 or current_mid <= 0 or underlying_now <= 0:
                     continue
-                valid_rows.append((event_ts, row, p, s, delta))
-            valid_rows.sort(key=lambda item: item[0])
-            if len(valid_rows) < 2:
+                if quote_ts is None:
+                    continue
+                current_snapshots.append((quote_ts, event_ts, row, trade_price, current_mid, underlying_now, delta_now))
+            current_snapshots.sort(key=lambda item: (item[0], item[1]))
+            if not current_snapshots:
                 continue
-            end_ts, end_row, p_now, s_now, _ = valid_rows[-1]
+            quote_end_ts, _, end_row, _, p_now, s_now, _ = current_snapshots[-1]
             start_candidates = [
                 item
-                for item in valid_rows
-                if (end_ts - item[0]).total_seconds() >= PRICING_LAG_MIN_BASELINE_SECONDS
+                for item in current_snapshots
+                if (quote_end_ts - item[1]).total_seconds() >= PRICING_LAG_MIN_BASELINE_SECONDS
             ]
             if not start_candidates:
                 continue
-            start_ts, _, p_start, s_start, delta = start_candidates[-1]
+            _, start_ts, start_row, p_start, _, _, delta = start_candidates[-1]
+            s_start = float(start_row.get("underlying_mid") or 0.0)
             actual_change = p_now - p_start
             expected_change = delta * (s_now - s_start)
             if abs(actual_change) < PRICING_LAG_MIN_PRICE_MOVE and abs(s_now - s_start) < PRICING_LAG_MIN_UNDERLYING_MOVE:
@@ -1383,7 +1388,7 @@ class SigmatiqNexus:
                 "side": str(end_row.get("side") or details["side"] or ""),
                 "expiry_date": details["expiry_date"],
                 "strike": details["strike"],
-                "baseline_seconds": int((end_ts - start_ts).total_seconds()),
+                "baseline_seconds": int((quote_end_ts - start_ts).total_seconds()),
             })
         return profiles
 
