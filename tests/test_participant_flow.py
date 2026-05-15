@@ -266,6 +266,27 @@ class TestAggregateWindow:
         assert result["data_quality"]["status"] == "degraded"
         assert "low_confidence_labels" in result["data_quality"]["degraded"]
 
+    def test_repeat_cluster_structure_keeps_window_usable(self):
+        rows = [
+            _row(
+                raw_symbol="SPY   260508C00560000",
+                premium=35_000,
+                side="C",
+                aggressor="M",
+                option_bid=1.0,
+                option_ask=2.0,
+                option_mid=1.5,
+            )
+            for _ in range(10)
+        ]
+        result = pf.aggregate_participant_flow_window(_make_df(rows), CONFIG)
+        assert result["institutional_like_flow"]["dominant_shape"] == "repeat_cluster"
+        assert result["institutional_like_flow"]["trade_count"] == 10
+        assert result["window_side_read"]["premium_bias"] == "call_heavy"
+        assert result["window_side_read"]["confidence"] == "medium"
+        assert result["data_quality"]["status"] == "usable"
+        assert "low_confidence_labels" not in result["data_quality"]["degraded"]
+
     def test_empty_dataframe(self):
         result = pf.aggregate_participant_flow_window(pl.DataFrame(), CONFIG)
         assert result["window_side_read"]["directional_read"] == "unknown"

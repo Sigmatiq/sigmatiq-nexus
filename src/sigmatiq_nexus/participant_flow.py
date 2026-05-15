@@ -331,11 +331,25 @@ def aggregate_participant_flow_window(
     else:
         directional_read = "conflicted"
 
-    # Confidence degrades when bid-side is significant or low-confidence labels dominate
+    # Confidence degrades when bid-side is significant or low-confidence labels dominate,
+    # unless premium structure is still strong enough to support a usable window read.
     low_conf_count = sum(1 for t in labeled if t["label"]["confidence"] == "low")
     mostly_low_conf = low_conf_count > len(labeled) * 0.5
+    retail_like_flow = _aggregate_participant_group(labeled, "retail_like")
+    institutional_like_flow = _aggregate_participant_group(labeled, "institutional_like")
+    institutional_cluster_signal = (
+        institutional_like_flow["dominant_shape"] == "repeat_cluster"
+        and institutional_like_flow["trade_count"] >= config["repeat_cluster_min_count"]
+        and institutional_like_flow["premium"] >= config["repeat_cluster_min_aggregate_premium"]
+    )
+    premium_side_signal = premium_bias in ("call_heavy", "put_heavy")
+    strong_window_structure = institutional_cluster_signal and premium_side_signal and not bid_dominant_window
 
-    if mostly_low_conf or bid_dominant_window:
+    if bid_dominant_window:
+        read_confidence = "low"
+    elif mostly_low_conf and strong_window_structure:
+        read_confidence = "medium"
+    elif mostly_low_conf:
         read_confidence = "low"
     elif aggressor_coverage > 0.8 and directional_read not in ("conflicted", "unknown"):
         read_confidence = "high"
@@ -383,10 +397,6 @@ def aggregate_participant_flow_window(
         "reason_codes": wsr_codes,
         "why": wsr_why,
     }
-
-    # --- participant groups ---
-    retail_like_flow = _aggregate_participant_group(labeled, "retail_like")
-    institutional_like_flow = _aggregate_participant_group(labeled, "institutional_like")
 
     # --- dominant_strategy_shape ---
     shape_premium: dict[str, float] = Counter()
@@ -467,6 +477,8 @@ def aggregate_participant_flow_window(
 
     if len(labeled) < config["thin_trade_count"]:
         dq_status = "thin"
+    elif strong_window_structure:
+        dq_status = "usable"
     elif effective_pct >= config["usable_label_pct"]:
         dq_status = "usable"
     elif effective_pct >= config["degraded_label_pct"]:
@@ -479,7 +491,7 @@ def aggregate_participant_flow_window(
     reason_codes = []
     if aggressor_coverage < 0.5:
         missing.append("aggressor")
-    if quality_pct < label_pct:
+    if quality_pct < label_pct and not strong_window_structure:
         degraded_list.append("low_confidence_labels")
         reason_codes.append("LOW_CONFIDENCE_LABELS")
 
