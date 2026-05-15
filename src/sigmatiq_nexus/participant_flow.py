@@ -311,10 +311,11 @@ def aggregate_participant_flow_window(
     has_aggressor_data = sum(1 for t in labeled if str(t["row"].get("aggressor") or "") in ("A", "B", "M"))
     aggressor_coverage = has_aggressor_data / len(labeled) if labeled else 0
 
-    # Bid-side premium is ambiguous — only ask-side confirmed flow drives direction
+    # Bid-side premium is ambiguous — only materially stronger bid-side pressure
+    # should override an otherwise structured completed-window read.
     bid_premium_total = sum(float(t["row"].get("premium") or 0) for t in labeled if str(t["row"].get("aggressor") or "") == "B")
     ask_premium_total = ask_call_premium + ask_put_premium
-    bid_dominant_window = bid_premium_total > ask_premium_total
+    bid_dominant_window = bid_premium_total > ask_premium_total * ratio
 
     if aggressor_coverage < 0.5:
         directional_read = "unknown"

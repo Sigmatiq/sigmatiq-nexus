@@ -344,7 +344,7 @@ Confidence must degrade when:
 
 Opening/closing status remains unknown in Nexus v1, but that alone does not degrade a completed-window payload. Degradation should reflect missing aggressor coverage, thin samples, or low-confidence trade labels.
 
-One bounded exception is allowed for main-symbol windows with strong repeated institutional clustering: if a completed window has a repeat-cluster institutional read above the configured premium threshold, a clear call-vs-put premium bias, and no bid-side dominance, the payload can remain `usable` even when many individual labels are low-confidence due to quote width. That preserves structurally meaningful windows without pretending the labels were high-quality.
+One bounded exception is allowed for main-symbol windows with strong repeated institutional clustering: if a completed window has a repeat-cluster institutional read above the configured premium threshold, a clear call-vs-put premium bias, and no materially stronger bid-side premium imbalance, the payload can remain `usable` even when many individual labels are low-confidence due to quote width. That preserves structurally meaningful windows without pretending the labels were high-quality.
 
 Suggested `data_quality.status` values:
 

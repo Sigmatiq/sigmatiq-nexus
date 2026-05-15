@@ -160,7 +160,7 @@ class TestAggregateWindow:
     def test_bid_heavy_window_returns_unknown(self):
         """Bid-side call premium with smaller ask-side put should not be directional."""
         rows = [
-            _row(premium=300_000, side="C", aggressor="B"),
+            _row(premium=500_000, side="C", aggressor="B"),
             _row(premium=250_000, side="P", aggressor="A", raw_symbol="SPY   260508P00555000", delta=-0.40),
         ]
         result = pf.aggregate_participant_flow_window(_make_df(rows), CONFIG)
