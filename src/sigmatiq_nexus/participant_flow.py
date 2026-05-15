@@ -199,16 +199,41 @@ def _build_window_context(rows: list[dict]) -> dict:
     """Pre-compute window-level stats for the trade labeler."""
     contract_counts: dict[str, int] = Counter()
     contract_premiums: dict[str, float] = Counter()
+    contract_stats: dict[str, dict] = {}
     total_premium = 0.0
     for r in rows:
         rs = str(r.get("raw_symbol") or "")
         p = float(r.get("premium") or 0)
+        side = str(r.get("side") or "").upper()
+        aggressor = str(r.get("aggressor") or "")
         contract_counts[rs] += 1
         contract_premiums[rs] += p
+        stats = contract_stats.setdefault(
+            rs,
+            {
+                "count": 0,
+                "premium": 0.0,
+                "call_premium": 0.0,
+                "put_premium": 0.0,
+                "ask_premium": 0.0,
+                "bid_premium": 0.0,
+            },
+        )
+        stats["count"] += 1
+        stats["premium"] += p
+        if side == "C":
+            stats["call_premium"] += p
+        elif side == "P":
+            stats["put_premium"] += p
+        if aggressor == "A":
+            stats["ask_premium"] += p
+        elif aggressor == "B":
+            stats["bid_premium"] += p
         total_premium += p
     return {
         "contract_counts": dict(contract_counts),
         "contract_premiums": dict(contract_premiums),
+        "contract_stats": contract_stats,
         "total_premium": total_premium,
     }
 
@@ -266,6 +291,37 @@ def _aggregate_participant_group(labeled: list[dict], group: str) -> dict:
         "reason_codes": list(dict.fromkeys(all_codes)),
         "why": list({c["code"]: c for c in all_why}.values()),
     }
+
+
+def _has_aligned_repeat_cluster_structure(window_context: dict, premium_bias: str, config: dict) -> bool:
+    """Detect a repeated high-premium contract cluster even if trade labels stay low-confidence."""
+    if premium_bias not in {"call_heavy", "put_heavy"}:
+        return False
+
+    ratio = config["side_dominance_ratio"]
+    contract_stats = window_context.get("contract_stats", {})
+    for stats in contract_stats.values():
+        if stats["count"] < config["repeat_cluster_min_count"]:
+            continue
+        if stats["premium"] < config["repeat_cluster_min_aggregate_premium"]:
+            continue
+
+        if stats["call_premium"] > stats["put_premium"] * ratio:
+            contract_bias = "call_heavy"
+        elif stats["put_premium"] > stats["call_premium"] * ratio:
+            contract_bias = "put_heavy"
+        else:
+            contract_bias = "balanced"
+
+        if contract_bias != premium_bias:
+            continue
+        if stats["ask_premium"] <= 0:
+            continue
+        if stats["bid_premium"] > stats["ask_premium"] * ratio:
+            continue
+        return True
+
+    return False
 
 
 def aggregate_participant_flow_window(
@@ -344,7 +400,12 @@ def aggregate_participant_flow_window(
         and institutional_like_flow["premium"] >= config["repeat_cluster_min_aggregate_premium"]
     )
     premium_side_signal = premium_bias in ("call_heavy", "put_heavy")
-    strong_window_structure = institutional_cluster_signal and premium_side_signal and not bid_dominant_window
+    aligned_repeat_cluster_signal = _has_aligned_repeat_cluster_structure(window_context, premium_bias, config)
+    strong_window_structure = (
+        (institutional_cluster_signal or aligned_repeat_cluster_signal)
+        and premium_side_signal
+        and not bid_dominant_window
+    )
 
     if bid_dominant_window:
         read_confidence = "low"

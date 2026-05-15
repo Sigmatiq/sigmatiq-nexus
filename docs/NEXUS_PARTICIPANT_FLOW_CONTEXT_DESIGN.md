@@ -266,7 +266,7 @@ These are heuristics, not identity claims.
 
 Important rule:
 
-`repeat_cluster` alone must not force `institutional_like`. It qualifies only when aggregate premium, size, or execution quality clears a configured threshold.
+`repeat_cluster` alone must not force `institutional_like`. It qualifies only when aggregate premium, size, or execution quality clears a configured threshold. Window-level usability can still treat a repeated high-premium contract cluster as structurally meaningful even if the individual trade labels resolve to low-confidence directional buying rather than `repeat_cluster`.
 
 ### Strategy Shape Labels
 
