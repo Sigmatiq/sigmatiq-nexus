@@ -472,7 +472,12 @@ def test_nexus_health_payload_reports_inputs_outputs_and_blocked_reasons():
 
 def test_append_persistence_event_publishes_nexus_health_key():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
-    worker.redis = FakeRedis()
+    worker.redis = FakeRedis({
+        "options:live:gex:SPY": json.dumps({
+            "netGex": -2_500_000_000.0,
+            "asOf": "2026-05-08T13:59:00Z",
+        }),
+    })
     worker.health_state = worker._empty_health_state()
 
     asyncio.run(
@@ -2757,7 +2762,12 @@ def test_momentum_specialist_sorts_rows_before_dynamic_grouping():
 
 def test_publish_participant_flow_context_sets_keys_and_publishes():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
-    worker.redis = FakeRedis()
+    worker.redis = FakeRedis({
+        "options:live:gex:SPY": json.dumps({
+            "netGex": -2_500_000_000.0,
+            "asOf": "2026-05-08T13:59:00Z",
+        }),
+    })
     worker.participant_flow_reported = set()
     worker.buffers = {"SPY": deque(maxlen=100)}
     worker.buffers["SPY"].extend([
@@ -2809,9 +2819,10 @@ def test_publish_participant_flow_context_sets_keys_and_publishes():
     assert msg["source"] == "sigmatiq_nexus"
     assert msg["window_side_read"]["dominant_side"] == "calls"
     assert msg["window_side_read"]["premium_bias"] in ("call_heavy", "put_heavy", "balanced")
-    assert msg["dealer_inferred_pressure"]["underlying_hedge_direction"] == "unknown"
+    assert msg["dealer_inferred_pressure"]["underlying_hedge_direction"] == "buy_underlying"
+    assert msg["dealer_inferred_pressure"]["impact_state"] == "destabilizing"
     assert msg["data_quality"]["status"] in ("usable", "degraded", "thin", "stale", "unknown")
-    assert "opening_or_closing_unknown" in msg["data_quality"]["degraded"]
+    assert "opening_or_closing_unknown" not in msg["data_quality"]["degraded"]
 
     # Verify persistence stream
     assert len(worker.redis.xadds) == 1

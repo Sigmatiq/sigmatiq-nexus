@@ -475,17 +475,19 @@ def aggregate_participant_flow_window(
         dq_status = "degraded"
 
     missing = []
-    degraded_list = ["opening_or_closing_unknown"]
+    degraded_list = []
+    reason_codes = []
     if aggressor_coverage < 0.5:
         missing.append("aggressor")
     if quality_pct < label_pct:
         degraded_list.append("low_confidence_labels")
+        reason_codes.append("LOW_CONFIDENCE_LABELS")
 
     data_quality = {
         "status": dq_status,
         "missing": missing,
         "degraded": degraded_list,
-        "reason_codes": ["OPEN_CLOSE_UNAVAILABLE"],
+        "reason_codes": reason_codes,
     }
 
     return {
@@ -520,8 +522,8 @@ def _empty_aggregation() -> dict:
         },
         "top_contracts": [],
         "data_quality": {
-            "status": "unknown", "missing": [], "degraded": ["opening_or_closing_unknown"],
-            "reason_codes": ["OPEN_CLOSE_UNAVAILABLE"],
+            "status": "unknown", "missing": [], "degraded": [],
+            "reason_codes": [],
         },
     }
 
@@ -531,15 +533,113 @@ def _empty_aggregation() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def infer_dealer_pressure(window_context: dict | None = None) -> dict:
-    """v1: always returns unknown. P1 will wire dealer context."""
+def infer_dealer_pressure(window_context: dict | None = None, dealer_context: dict | None = None) -> dict:
+    """Infer simple dealer hedge direction from window flow and live GEX context."""
+    window_context = window_context or {}
+    dealer_context = dealer_context or {}
+    directional_read = str(window_context.get("directional_read") or "unknown").lower()
+    flow_confidence = str(window_context.get("confidence") or "low").lower()
+    aggressor_bias = str(window_context.get("aggressor_bias") or "balanced").lower()
+    pricing_quality = str(dealer_context.get("pricing_quality") or "unknown").lower()
+    cheap_side = str(dealer_context.get("cheap_side") or "").upper()
+    net_gex_raw = dealer_context.get("net_gex")
+    net_gex_status = str(dealer_context.get("net_gex_status") or "missing").lower()
+    net_gex = None
+    try:
+        if net_gex_raw is not None:
+            net_gex = float(net_gex_raw)
+    except (TypeError, ValueError):
+        net_gex = None
+
+    if net_gex is None or net_gex_status not in {"fresh", "available"}:
+        return {
+            "underlying_hedge_direction": "unknown",
+            "impact_state": "unknown",
+            "confidence": "low",
+            "source": "unavailable",
+            "reason_codes": ["DEALER_CONTEXT_STALE_OR_MISSING"],
+            "why": [{"code": "DEALER_CONTEXT_STALE_OR_MISSING", "text": "Dealer context is missing or stale"}],
+        }
+
+    inferred_direction = directional_read
+    source = "heuristic_net_gex_flow"
+    reason_codes: list[str] = []
+    why: list[dict] = []
+
+    pricing_aligned = (
+        pricing_quality == "usable"
+        and (
+            (cheap_side == "C" and aggressor_bias == "ask_side_call_heavy")
+            or (cheap_side == "P" and aggressor_bias == "ask_side_put_heavy")
+        )
+    )
+    if directional_read not in {"bullish", "bearish"}:
+        if pricing_aligned:
+            inferred_direction = "bullish" if cheap_side == "C" else "bearish"
+            source = "heuristic_net_gex_flow_pricing_alignment"
+            reason_codes.append("PRICING_SIDE_ALIGNMENT")
+            why.append({
+                "code": "PRICING_SIDE_ALIGNMENT",
+                "text": "Pricing-side skew aligns with aggressive flow even though the window read is conflicted",
+            })
+        else:
+            return {
+                "underlying_hedge_direction": "unknown",
+                "impact_state": "unknown",
+                "confidence": "low",
+                "source": "heuristic_net_gex_flow",
+                "reason_codes": ["FLOW_DIRECTION_CONFLICTED"],
+                "why": [{"code": "FLOW_DIRECTION_CONFLICTED", "text": "Flow direction is conflicted, so dealer impact stays inconclusive"}],
+            }
+
+    if net_gex < 0:
+        if inferred_direction == "bullish":
+            hedge_direction = "buy_underlying"
+        else:
+            hedge_direction = "sell_underlying"
+        impact_state = "destabilizing"
+        reason_codes.append("NEGATIVE_GEX_HEDGE_ACCELERATES_FLOW")
+        why.append({
+            "code": "NEGATIVE_GEX_HEDGE_ACCELERATES_FLOW",
+            "text": "Negative gamma conditions can force dealers to hedge in the same direction as the move",
+        })
+    elif net_gex > 0:
+        if inferred_direction == "bullish":
+            hedge_direction = "sell_underlying"
+        else:
+            hedge_direction = "buy_underlying"
+        impact_state = "stabilizing"
+        reason_codes.append("POSITIVE_GEX_HEDGE_DAMPS_FLOW")
+        why.append({
+            "code": "POSITIVE_GEX_HEDGE_DAMPS_FLOW",
+            "text": "Positive gamma conditions can push dealers to hedge against the move",
+        })
+    else:
+        return {
+            "underlying_hedge_direction": "unknown",
+            "impact_state": "unknown",
+            "confidence": "low",
+            "source": source,
+            "reason_codes": ["NET_GEX_BALANCED"],
+            "why": [{"code": "NET_GEX_BALANCED", "text": "Net gamma is near flat, so hedge direction is not informative"}],
+        }
+
+    if source == "heuristic_net_gex_flow_pricing_alignment":
+        confidence = "medium"
+    elif flow_confidence == "high":
+        confidence = "high"
+    elif flow_confidence == "medium":
+        confidence = "medium"
+    else:
+        confidence = "low"
+
     return {
-        "underlying_hedge_direction": "unknown",
-        "impact_state": "unknown",
-        "confidence": "low",
-        "source": "unavailable",
-        "reason_codes": ["DEALER_CONTEXT_STALE_OR_MISSING"],
-        "why": [{"code": "DEALER_CONTEXT_STALE_OR_MISSING", "text": "Dealer inference not yet implemented in v1"}],
+        "underlying_hedge_direction": hedge_direction,
+        "impact_state": impact_state,
+        "confidence": confidence,
+        "source": source,
+        "reason_codes": reason_codes,
+        "why": why,
     }
 
 
@@ -554,10 +654,11 @@ def build_participant_flow_payload(
     slot: dict,
     session_date,
     config: dict,
+    dealer_context: dict | None = None,
 ) -> dict:
     """Build the complete participant flow context payload for a completed window."""
     aggregated = aggregate_participant_flow_window(df, config)
-    dealer = infer_dealer_pressure()
+    dealer = infer_dealer_pressure(aggregated.get("window_side_read"), dealer_context)
 
     window_key = slot["entry_label"]
     now = datetime.now(timezone.utc)

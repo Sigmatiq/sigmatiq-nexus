@@ -69,6 +69,7 @@ def _pf_payload(**overrides):
             "impact_state": "unknown",
             "confidence": "low",
             "source": "unavailable",
+            "why": [{"code": "DEALER_CONTEXT_STALE_OR_MISSING", "text": "Dealer context is missing or stale"}],
         },
         "dominant_strategy_shape": {
             "shape": "directional_call_buying",
@@ -84,7 +85,7 @@ def _pf_payload(**overrides):
         "data_quality": {
             "status": "usable",
             "missing": [],
-            "degraded": ["opening_or_closing_unknown"],
+            "degraded": [],
         },
     }
     for k, v in overrides.items():
@@ -134,7 +135,7 @@ class TestParticipantFlowNarrative:
         payload = _pf_payload(data_quality={
             "status": "degraded",
             "missing": [],
-            "degraded": ["opening_or_closing_unknown", "low_confidence_labels"],
+            "degraded": ["low_confidence_labels"],
         })
         result = narratives.build_participant_flow_context_narrative(payload)
         assert any("low confidence" in c.lower() for c in result["narrative"]["caveats"])
@@ -147,13 +148,20 @@ class TestParticipantFlowNarrative:
         result = narratives.build_participant_flow_context_narrative(_pf_payload())
         assert any("not a trade recommendation" in c.lower() for c in result["narrative"]["caveats"])
 
-    def test_opening_closing_unavailable_caveat(self):
-        result = narratives.build_participant_flow_context_narrative(_pf_payload())
-        assert any("opening/closing" in c.lower() for c in result["narrative"]["caveats"])
+    def test_known_dealer_impact_appears_in_what_it_means(self):
+        payload = _pf_payload(dealer_inferred_pressure={
+            "underlying_hedge_direction": "sell_underlying",
+            "impact_state": "stabilizing",
+            "confidence": "medium",
+            "source": "heuristic_net_gex_flow",
+            "why": [{"code": "POSITIVE_GEX_HEDGE_DAMPS_FLOW", "text": "Positive gamma conditions can push dealers to hedge against the move"}],
+        })
+        result = narratives.build_participant_flow_context_narrative(payload)
+        assert any("dealer hedging likely leans against the move" in c.lower() for c in result["narrative"]["what_it_means"])
 
     def test_thin_quality_changes_summary(self):
         payload = _pf_payload(
-            data_quality={"status": "thin", "missing": [], "degraded": ["opening_or_closing_unknown"]},
+            data_quality={"status": "thin", "missing": [], "degraded": []},
             window_side_read={
                 "premium_bias": "balanced", "aggressor_bias": "balanced",
                 "directional_read": "unknown", "confidence": "low",
@@ -165,14 +173,14 @@ class TestParticipantFlowNarrative:
 
     def test_degraded_quality_changes_summary(self):
         payload = _pf_payload(
-            data_quality={"status": "degraded", "missing": ["aggressor"], "degraded": ["opening_or_closing_unknown"]},
+            data_quality={"status": "degraded", "missing": ["aggressor"], "degraded": []},
         )
         result = narratives.build_participant_flow_context_narrative(payload)
         assert result["summary"].startswith("Degraded read:")
 
     def test_stale_quality_changes_summary(self):
         payload = _pf_payload(
-            data_quality={"status": "stale", "missing": [], "degraded": ["opening_or_closing_unknown"]},
+            data_quality={"status": "stale", "missing": [], "degraded": []},
         )
         result = narratives.build_participant_flow_context_narrative(payload)
         assert result["summary"].startswith("Stale read:")
@@ -180,7 +188,7 @@ class TestParticipantFlowNarrative:
 
     def test_unknown_quality_changes_summary(self):
         payload = _pf_payload(
-            data_quality={"status": "unknown", "missing": [], "degraded": ["opening_or_closing_unknown"]},
+            data_quality={"status": "unknown", "missing": [], "degraded": []},
         )
         result = narratives.build_participant_flow_context_narrative(payload)
         assert result["summary"].startswith("Unknown read:")

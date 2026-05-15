@@ -147,8 +147,6 @@ def build_participant_flow_context_narrative(payload: dict) -> dict:
     caveats = []
     degraded = dq.get("degraded") or []
 
-    if "opening_or_closing_unknown" in degraded:
-        caveats.append("Opening/closing status is unavailable.")
     if "low_confidence_labels" in degraded:
         caveats.append("Most trade labels have low confidence due to bid-side or wide-spread ambiguity.")
 
@@ -156,7 +154,15 @@ def build_participant_flow_context_narrative(payload: dict) -> dict:
 
     dealer_dir = dealer.get("underlying_hedge_direction", "unknown")
     if dealer_dir == "unknown":
-        caveats.append("Dealer pressure is unknown because dealer context is unavailable.")
+        dealer_why = dealer.get("why") or []
+        dealer_text = dealer_why[0].get("text") if dealer_why and isinstance(dealer_why[0], dict) else None
+        caveats.append((dealer_text or "Dealer pressure is unknown because dealer context is unavailable").rstrip(".") + ".")
+    else:
+        impact_state = dealer.get("impact_state")
+        if impact_state == "stabilizing":
+            what_it_means.append("Dealer hedging likely leans against the move in this window.")
+        elif impact_state == "destabilizing":
+            what_it_means.append("Dealer hedging likely reinforces the move in this window.")
 
     caveats.append("This is not a trade recommendation.")
 

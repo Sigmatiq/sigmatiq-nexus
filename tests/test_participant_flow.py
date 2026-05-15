@@ -221,7 +221,7 @@ class TestAggregateWindow:
         rows = [_row(aggressor="A") for _ in range(15)]
         result = pf.aggregate_participant_flow_window(_make_df(rows), CONFIG)
         assert result["data_quality"]["status"] == "usable"
-        assert "opening_or_closing_unknown" in result["data_quality"]["degraded"]
+        assert result["data_quality"]["degraded"] == []
 
     def test_data_quality_thin(self):
         rows = [_row()]
@@ -279,13 +279,41 @@ class TestAggregateWindow:
 
 class TestDealerInference:
 
-    def test_v1_returns_unknown(self):
+    def test_missing_context_returns_unknown(self):
         result = pf.infer_dealer_pressure()
         assert result["underlying_hedge_direction"] == "unknown"
         assert result["impact_state"] == "unknown"
         assert result["confidence"] == "low"
         assert result["source"] == "unavailable"
         assert "DEALER_CONTEXT_STALE_OR_MISSING" in result["reason_codes"]
+
+    def test_negative_gex_bullish_flow_is_destabilizing(self):
+        result = pf.infer_dealer_pressure(
+            {"directional_read": "bullish", "confidence": "high", "aggressor_bias": "ask_side_call_heavy"},
+            {"net_gex": -3.5e9, "net_gex_status": "fresh", "pricing_quality": "usable", "cheap_side": "C"},
+        )
+        assert result["underlying_hedge_direction"] == "buy_underlying"
+        assert result["impact_state"] == "destabilizing"
+        assert result["confidence"] == "high"
+
+    def test_positive_gex_bearish_flow_is_stabilizing(self):
+        result = pf.infer_dealer_pressure(
+            {"directional_read": "bearish", "confidence": "medium", "aggressor_bias": "ask_side_put_heavy"},
+            {"net_gex": 2.1e9, "net_gex_status": "fresh", "pricing_quality": "usable", "cheap_side": "P"},
+        )
+        assert result["underlying_hedge_direction"] == "buy_underlying"
+        assert result["impact_state"] == "stabilizing"
+        assert result["confidence"] == "medium"
+
+    def test_conflicted_flow_uses_pricing_alignment_when_available(self):
+        result = pf.infer_dealer_pressure(
+            {"directional_read": "conflicted", "confidence": "low", "aggressor_bias": "ask_side_put_heavy"},
+            {"net_gex": -2.0e9, "net_gex_status": "fresh", "pricing_quality": "usable", "cheap_side": "P"},
+        )
+        assert result["underlying_hedge_direction"] == "sell_underlying"
+        assert result["impact_state"] == "destabilizing"
+        assert result["confidence"] == "medium"
+        assert result["source"] == "heuristic_net_gex_flow_pricing_alignment"
 
 
 # ---------------------------------------------------------------------------
@@ -332,12 +360,26 @@ class TestBuildPayload:
         assert "top_contracts" in msg
         assert "data_quality" in msg
 
-    def test_payload_dealer_inferred_pressure_unknown_v1(self):
+    def test_payload_dealer_inferred_pressure_unknown_without_context(self):
         from datetime import date
         rows = [_row()]
         msg = pf.build_participant_flow_payload(_make_df(rows), "SPY", self._slot(), date(2026, 5, 8), CONFIG)
         assert msg["dealer_inferred_pressure"]["underlying_hedge_direction"] == "unknown"
         assert msg["dealer_inferred_pressure"]["impact_state"] == "unknown"
+
+    def test_payload_uses_dealer_context_when_available(self):
+        from datetime import date
+        rows = [_row(aggressor="A") for _ in range(15)]
+        msg = pf.build_participant_flow_payload(
+            _make_df(rows),
+            "SPY",
+            self._slot(),
+            date(2026, 5, 8),
+            CONFIG,
+            dealer_context={"net_gex": -1.2e9, "net_gex_status": "fresh", "pricing_quality": "usable", "cheap_side": "C"},
+        )
+        assert msg["dealer_inferred_pressure"]["underlying_hedge_direction"] == "buy_underlying"
+        assert msg["dealer_inferred_pressure"]["impact_state"] == "destabilizing"
 
 
 # ---------------------------------------------------------------------------

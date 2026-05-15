@@ -186,8 +186,8 @@ Use the existing Nexus window key for Redis compatibility and explicit ET timest
   "data_quality": {
     "status": "usable",
     "missing": [],
-    "degraded": ["opening_or_closing_unknown"],
-    "reason_codes": ["OPEN_CLOSE_UNAVAILABLE"]
+    "degraded": [],
+    "reason_codes": []
   },
   "source": "sigmatiq_nexus"
 }
@@ -202,7 +202,7 @@ Separate facts from interpretation.
 | `premium_bias` | observed | Call vs put premium imbalance. |
 | `aggressor_bias` | observed/derived | Ask/bid side dominance after quote-gated aggressor classification. |
 | `directional_read` | inferred | Bullish/bearish/neutral/conflicted read from premium + aggressor + quality. |
-| `dealer_inferred_pressure` | inferred | Hedge-direction and market-impact inference from dealer context plus flow. |
+| `dealer_inferred_pressure` | inferred | Hedge-direction and market-impact inference from fresh net GEX plus completed-window flow, with pricing-side alignment only as a secondary tiebreaker. |
 
 Allowed `directional_read` values:
 
@@ -326,8 +326,8 @@ Initial reason-code examples:
 | `MISSING_FRESH_CONTRACT_QUOTE` | Quote data was missing or stale. |
 | `WIDE_SPREAD_LOW_CONFIDENCE` | Spread was too wide for confident aggressor classification. |
 | `REPEAT_CLUSTER_BELOW_INSTITUTIONAL_THRESHOLD` | Repeats exist but not enough premium/size for institutional-like. |
-| `OPEN_CLOSE_UNAVAILABLE` | True opening/closing status is unavailable. |
 | `DEALER_CONTEXT_STALE_OR_MISSING` | Dealer inference could not be computed safely. |
+| `LOW_CONFIDENCE_LABELS` | Most labels were inferred with low confidence, usually from bid-side or wide-spread ambiguity. |
 
 ## Data Quality And Confidence Degradation
 
@@ -339,9 +339,10 @@ Confidence must degrade when:
 - bid/ask is missing
 - underlying price is stale
 - OPRA print is late or out of sequence
-- opening/closing status is unknown
 - sample size is too small
 - one trade dominates but aggressor is ambiguous
+
+Opening/closing status remains unknown in Nexus v1, but that alone does not degrade a completed-window payload. Degradation should reflect missing aggressor coverage, thin samples, or low-confidence trade labels.
 
 Suggested `data_quality.status` values:
 

@@ -2676,7 +2676,25 @@ class SigmatiqNexus:
         df = await self._window_df_for_symbol(symbol, slot, session_date)
         if df.is_empty():
             return
-        msg = pf.build_participant_flow_payload(df, symbol, slot, session_date, pf.PARTICIPANT_FLOW_DEFAULT_CONFIG)
+        reference_time = self._window_reference_time(df)
+        _, _, net_gex, context_status = await self.get_context_with_quality(symbol, reference_time)
+        pricing_summary = self._window_pricing_summary(df)
+        dealer_context = {
+            "net_gex": net_gex,
+            "net_gex_status": context_status.get("net_gex"),
+            "cheap_side": pricing_summary.get("cheap_side"),
+            "costly_side": pricing_summary.get("costly_side"),
+            "pricing_quality": pricing_summary.get("pricing_quality"),
+            "pricing_quality_reason": pricing_summary.get("pricing_quality_reason"),
+        }
+        msg = pf.build_participant_flow_payload(
+            df,
+            symbol,
+            slot,
+            session_date,
+            pf.PARTICIPANT_FLOW_DEFAULT_CONFIG,
+            dealer_context=dealer_context,
+        )
         redis_key = f"nexus_participant_flow_context:{symbol}:{slot['entry_label']}"
         await self.redis.set(redis_key, json.dumps(msg), ex=48 * 3600)
         await self.redis.set(f"nexus_participant_flow_context:{symbol}:latest", json.dumps(msg), ex=8 * 3600)
