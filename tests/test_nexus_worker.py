@@ -1289,6 +1289,47 @@ def test_window_pricing_requires_current_quote_snapshot():
     assert summary["pricing_quality_reason"] == "no_reliable_pricing_profiles"
 
 
+def test_normalize_trade_payload_derives_price_from_premium_and_size():
+    normalized = nw.normalize_trade_payload({
+        "symbol": "SPY",
+        "raw_symbol": "SPY   260505C00720000",
+        "ts_utc": "2026-05-05T13:35:00Z",
+        "side": "C",
+        "size": 200,
+        "premium": 200_000,
+        "is_sweep": False,
+        "aggressor": "A",
+    })
+
+    assert normalized["price"] == 10.0
+    assert normalized["premium"] == 200_000.0
+
+
+def test_window_pricing_uses_derived_trade_price_from_premium_and_size():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    df = pl.DataFrame([
+        nw.normalize_trade_payload({
+            "symbol": "SPY",
+            "raw_symbol": "SPY   260505C00720000",
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "side": "C",
+            "size": 200,
+            "premium": 200_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": 0.50,
+            "underlying_mid": 720.0,
+            "option_mid": 10.4,
+            "quote_ts_utc": "2026-05-05T14:00:00Z",
+        }),
+    ])
+
+    profiles = worker._contract_pricing_profiles(df)
+
+    assert len(profiles) == 1
+    assert profiles[0]["raw_symbol"] == "SPY   260505C00720000"
+
+
 def _contract_state(mid: float, bid: float, ask: float) -> str:
     return json.dumps({
         "optionMid": mid,

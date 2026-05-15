@@ -789,8 +789,11 @@ def normalize_trade_payload(payload: dict) -> dict:
     symbol = payload.get("symbol") or payload.get("underlying")
     raw_side = payload.get("side")
     option_side = _canonical_option_side(raw_side) or _option_side_from_raw_symbol(raw_symbol) or ""
-    price = float(payload.get("price") or 0.0)
     size = float(payload.get("size") or payload.get("contracts") or 0.0)
+    premium_value = _payload_float(payload, "premium")
+    price = _payload_float(payload, "price") or 0.0
+    if price <= 0 and premium_value not in (None, 0.0) and size > 0:
+        price = float(premium_value) / (size * 100.0)
     ts_utc = payload.get("ts_utc") or payload.get("timestamp")
     ts_event_ns = payload.get("ts_event_ns")
     if not ts_utc and ts_event_ns:
@@ -824,8 +827,9 @@ def normalize_trade_payload(payload: dict) -> dict:
         "symbol": str(symbol or "").strip().upper(),
         "raw_symbol": raw_symbol,
         "ts_utc": ts_utc,
+        "price": float(price or 0.0),
         "side": option_side,
-        "premium": float(payload.get("premium") or price * size * 100.0),
+        "premium": float(premium_value or price * size * 100.0),
         "is_sweep": is_sweep,
         "aggressor": aggressor,
     }
