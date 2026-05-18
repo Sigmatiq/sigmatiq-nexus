@@ -44,6 +44,7 @@ MCP and chat clients should call `sigmatiq-api` endpoints. They should not read 
 
 | Message | Redis key(s) | Pub/Sub | Schedule | Primary use | Trade recommendation? |
 |---|---|---|---|---|---|
+| `STRATEGY_AUDIT` | `nexus_strategy_audit:{symbol}:{strategy}:{entry_label}` | `signal:strategy_audit`, `signal:strategy_audit:{strategy}` | Completed strategy windows | Per-lane decision audit for every strategy check, including skipped/not-applicable lanes, feature blocks, `NO_BET` gates, and directional window reads. | No |
 | `INTERMEDIATE` | `nexus_intermediate:{symbol}:{strategy}:{entry_label}` | `nexus_intermediate:updates`, `signal:intermediate:{strategy}` | Strategy windows | Stage-1 paper candidate before final quote gate or final decision. | No |
 | `BET` | `nexus_live_overlay:{symbol}` | `nexus_live_overlay:updates` | Strategy windows, only when a strategy passes | Final paper signal with exact `raw_symbol`, quote snapshot, reference price, freshness, and execution metadata. | Paper signal only |
 | `WINDOW_VIEW` | `nexus_window_view:{symbol}:{strategy}:{entry_label}` | `signal:window_view:{strategy}` | Completed strategy windows | Strategy-specific directional read for the completed window, even if no trade candidate is emitted. | No |
@@ -67,6 +68,7 @@ MCP and chat clients should call `sigmatiq-api` endpoints. They should not read 
 
 | Trader or agent question | Primary message | Notes |
 |---|---|---|
+| Why did this strategy not produce a paper signal? | `STRATEGY_AUDIT` | Use `decision`, `reason`, `inputs`, and optional `feature_failures` for the exact failed gate and threshold context. |
 | What did this strategy think about the completed window? | `WINDOW_VIEW` | Directional read only. It is intentionally weaker than a trade signal. |
 | Why did a strategy not form a usable read? | `BLOCKED` | Use `reason_summary`, missing fields, freshness, and data-quality fields. |
 | Did a strategy candidate appear before final validation? | `INTERMEDIATE` | Useful for audit and model/debug review. |
@@ -145,13 +147,13 @@ Recommended MCP tools:
 | What side is flow leaning in the latest SPY window? | `live_participant_flow_context` | `window_side_read`, `summary`, `data_quality` | Say latest completed window, not tick-now. |
 | Are retail-like or block-like traders active? | `live_participant_flow_context` | participant-like flow buckets and caveats | Say inferred from trade shape, not true identity. |
 | Which contracts were most traded or looked cheap/costly? | Future `live_option_market_context`, or `strategy-fit` if it embeds option context | top contracts, cheap/costly fields, `pricing_quality` | If pricing quality is unknown/degraded, do not call a side cheap. |
-| Why did Nexus not fire today? | Future `live_window_audit` | `BLOCKED`, `WINDOW_VIEW`, `WINDOW_PRICING`, late events | Current API coverage is incomplete for this question. |
+| Why did Nexus not fire today? | Future `live_window_audit` | `STRATEGY_AUDIT`, `BLOCKED`, `WINDOW_VIEW`, `WINDOW_PRICING`, late events | Strategy audit is now the canonical Redis source; API coverage still needs a read-through endpoint. |
 | What changed from yesterday in this window? | Future day-over-day endpoint | same-window aggregates, deltas, narratives | Requires persisted history beyond Redis latest TTL. |
 
 ## Current Gaps
 
 - A standalone `GET /v1/live/{symbol}/option-market-context` endpoint is not confirmed in the current API surface. `strategy-fit` can consume option-market context internally, but traders may need direct access.
-- There is no confirmed current API endpoint for the full `WINDOW_VIEW` / `BLOCKED` / `WINDOW_PRICING` audit surface.
+- There is no confirmed current API endpoint for the full `STRATEGY_AUDIT` / `WINDOW_VIEW` / `BLOCKED` / `WINDOW_PRICING` audit surface.
 - MCP tools still need to be mapped to the approved `sigmatiq-api` endpoints.
 - Day-over-day same-window comparison is designed separately but requires persisted history and an API surface before chat can answer it reliably.
 - Participant-flow `dealer_inferred_pressure` is currently `unknown` until dealer context is wired.

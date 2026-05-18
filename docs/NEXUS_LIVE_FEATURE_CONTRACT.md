@@ -411,6 +411,12 @@ Cheap/costly contract and side reads are only emitted when Nexus has point-in-ti
 
 ## Published Nexus Messages
 
+- `STRATEGY_AUDIT`
+  - Redis key: `nexus_strategy_audit:{symbol}:{strategy}:{entry_label}`
+  - Pub/Sub: `signal:strategy_audit` and `signal:strategy_audit:{strategy}`
+  - Meaning: per-lane stage-0 decision audit for every completed-window strategy check
+  - Decisions include `NO_BET`, `BLOCKED`, `SKIPPED`, and `WINDOW_VIEW`
+  - Payload includes the failed `reason`, window input totals, dominance thresholds, and optional `feature_failures`
 - `INTERMEDIATE`
   - Redis key: `nexus_intermediate:{symbol}:{strategy}:{entry_label}`
   - Pub/Sub: `nexus_intermediate:updates` with symbol and `signal:intermediate:{strategy}` with full payload

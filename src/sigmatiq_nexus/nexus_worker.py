@@ -469,9 +469,9 @@ def redis_active_position_key(session_date, symbol: str) -> str:
 
 def nexus_index_key(session_date, symbol: str, kind: str) -> str:
     """Per-(session_date, symbol) index set used by sigmatiq-api to enumerate
-    Nexus messages without scanning Redis. ``kind`` is one of ``window_view``,
-    ``intermediate``, ``spread``, ``pricing``, ``late_event``, ``omc``,
-    ``participant_flow``, ``final_block``."""
+    Nexus messages without scanning Redis. ``kind`` is one of ``strategy_audit``,
+    ``window_view``, ``intermediate``, ``spread``, ``pricing``, ``late_event``,
+    ``omc``, ``participant_flow``, ``final_block``."""
     return f"nexus:index:{session_date}:{symbol}:{kind}"
 
 
@@ -497,6 +497,8 @@ def symbol_from_input_stream(stream_name: str) -> str | None:
 
 
 def nexus_output_family(redis_key: str) -> str | None:
+    if redis_key.startswith("nexus_strategy_audit:"):
+        return "strategy_audit"
     if redis_key.startswith("nexus_window_view:"):
         return "window_view"
     if redis_key.startswith("nexus_window_pricing:"):
@@ -1083,6 +1085,7 @@ class SigmatiqNexus:
         self.signaled_today = set()
         self.feature_blocks_reported = set()
         self.window_views_reported = set()
+        self.strategy_audits_reported = set()
         self.window_pricing_reported = set()
         self.option_market_context_reported = set()
         self.participant_flow_reported = set()
@@ -1254,6 +1257,7 @@ class SigmatiqNexus:
             "missingSymbols": missing_symbols,
             "inputStreams": {symbol: input_stream_for_symbol(symbol) for symbol in expected_symbols},
             "outputFamilies": [
+                "strategy_audit",
                 "window_view",
                 "window_pricing",
                 "window_late_event",
@@ -1311,6 +1315,23 @@ class SigmatiqNexus:
                 "sweep_ratio": round(stats["sweep"], 4),
             })
         return fields
+
+    def _window_audit_inputs(self, df: pl.DataFrame, evidence: dict | None = None) -> dict:
+        stats = window_stats(df)
+        inputs = {
+            "rows": int(df.height),
+            "total_premium": stats["total_p"],
+            "call_premium": stats["call_p"],
+            "put_premium": stats["put_p"],
+            "sweep_ratio": stats["sweep"],
+            "dominant_side": dominant_side(stats),
+            "min_window_premium_required": MIN_WINDOW_PREMIUM,
+            "side_dominance_threshold": SIDE_DOMINANCE,
+            "open_call_dominance_threshold": OPEN_CALL_DOMINANCE,
+        }
+        if evidence:
+            inputs.update(evidence)
+        return inputs
 
     def _window_lead_contract(self, df: pl.DataFrame) -> dict[str, str | float | None]:
         if df.is_empty() or "raw_symbol" not in df.columns:
@@ -2532,6 +2553,66 @@ class SigmatiqNexus:
         await self._append_persistence_event_for_key(redis_key, msg)
         await self._publish(f"signal:window_view:{strategy}", json.dumps(msg))
 
+    async def _publish_strategy_audit(
+        self,
+        strategy: str,
+        symbol: str,
+        slot: dict,
+        session_date,
+        decision: str,
+        reason: str,
+        *,
+        sentiment: str | None = None,
+        inputs: dict | None = None,
+        feature_failures: dict[str, str] | None = None,
+    ) -> None:
+        key = (str(session_date), symbol, strategy, slot["entry_label"])
+        reported = getattr(self, "strategy_audits_reported", set())
+        if key in reported:
+            return
+        reported.add(key)
+        self.strategy_audits_reported = reported
+        msg = {
+            "v": NEXUS_SCHEMA_VERSION,
+            "kind": "nexus_strategy_decision_audit",
+            "strategy": strategy,
+            "symbol": symbol,
+            "stage": 0,
+            "decision": decision,
+            "reason": reason,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_date": str(session_date),
+            "entry_time": slot["entry_label"],
+            "window_start": slot["window_start"].isoformat(),
+            "window_end": slot["window_end"].isoformat(),
+            "source": "sigmatiq_nexus",
+            "inputs": inputs or {},
+        }
+        if sentiment is not None:
+            msg["sentiment"] = sentiment
+        if feature_failures:
+            msg["feature_failures"] = feature_failures
+            msg["missing_features"] = sorted(feature_failures.keys())
+        redis_key = f"nexus_strategy_audit:{symbol}:{strategy}:{slot['entry_label']}"
+        payload = json.dumps(msg)
+        await self.redis.set(redis_key, payload)
+        await self._index_sadd(
+            nexus_index_key(session_date, symbol, "strategy_audit"),
+            f"{strategy}:{slot['entry_label']}",
+        )
+        await self._append_persistence_event_for_key(redis_key, msg)
+        await self._publish("signal:strategy_audit", payload)
+        await self._publish(f"signal:strategy_audit:{strategy}", payload)
+        self._log(
+            "strategy_decision_audit_published",
+            strategy=strategy,
+            symbol=symbol,
+            decision=decision,
+            reason=reason,
+            session_date=str(session_date),
+            entry_time=slot["entry_label"],
+        )
+
     async def _publish_window_view(
         self,
         strategy: str,
@@ -2729,9 +2810,28 @@ class SigmatiqNexus:
         ]
         for strategy, assessor in strategies:
             if not strategy_window_view_applicable(strategy, symbol, slot):
+                await self._publish_strategy_audit(
+                    strategy,
+                    symbol,
+                    slot,
+                    session_date,
+                    "SKIPPED",
+                    "strategy_not_applicable_to_symbol_or_window",
+                    inputs=self._window_audit_inputs(df),
+                )
                 continue
             failures = await self._strategy_feature_failures(strategy, symbol, df, reference_time)
             if failures:
+                await self._publish_strategy_audit(
+                    strategy,
+                    symbol,
+                    slot,
+                    session_date,
+                    "BLOCKED",
+                    "live_feature_quality_gate_closed",
+                    inputs=self._window_audit_inputs(df),
+                    feature_failures=failures,
+                )
                 await self._publish_feature_block(strategy, symbol, slot, session_date, failures)
                 continue
             result = await assessor(df, symbol, slot)
@@ -2740,6 +2840,17 @@ class SigmatiqNexus:
             else:
                 sentiment, reason = result
                 evidence = None
+            audit_decision = "NO_BET" if sentiment == "CHOP" else "WINDOW_VIEW"
+            await self._publish_strategy_audit(
+                strategy,
+                symbol,
+                slot,
+                session_date,
+                audit_decision,
+                reason,
+                sentiment=sentiment,
+                inputs=self._window_audit_inputs(df, evidence),
+            )
             await self._publish_window_view(strategy, symbol, sentiment, reason, slot, session_date, evidence=evidence)
         self._current_window_df = pl.DataFrame()
         self._current_window_pricing_summary = {}

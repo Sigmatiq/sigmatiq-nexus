@@ -1138,6 +1138,114 @@ def test_publish_window_view_includes_open_specialist_evidence():
     assert payload["dominant_side"] == "C"
 
 
+def test_publish_window_assessments_writes_no_bet_strategy_audit():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:vrp:QQQ": json.dumps({"ivRank": 22, "asOf": "2026-05-05T14:00:00Z"}),
+        "options:live:iv_surface:QQQ": json.dumps({"atmIv": 0.22, "asOf": "2026-05-05T14:00:00Z"}),
+        "options:live:gex:QQQ": json.dumps({"netGex": 1_000_000, "asOf": "2026-05-05T14:00:00Z"}),
+    })
+    worker.strategy_audits_reported = set()
+    worker.window_views_reported = set()
+    worker.feature_blocks_reported = set()
+    worker.health_state = worker._empty_health_state()
+    worker._log = lambda *args, **kwargs: None
+    df = pl.DataFrame([
+        nw.normalize_trade_payload({
+            "symbol": "QQQ",
+            "raw_symbol": "QQQ   260505C00500000",
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "side": "C",
+            "price": 2.0,
+            "size": 1000,
+            "premium": 200_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": 0.50,
+            "gamma": 0.01,
+            "greeks_ts_utc": "2026-05-05T13:35:00Z",
+            "underlying_mid": 500.0,
+            "underlying_ts_utc": "2026-05-05T13:35:00Z",
+            "option_mid": 2.0,
+            "quote_age_ms": 100,
+        }),
+        nw.normalize_trade_payload({
+            "symbol": "QQQ",
+            "raw_symbol": "QQQ   260505P00500000",
+            "ts_utc": "2026-05-05T13:36:00Z",
+            "side": "P",
+            "price": 1.9,
+            "size": 1000,
+            "premium": 190_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": -0.50,
+            "gamma": 0.01,
+            "greeks_ts_utc": "2026-05-05T13:36:00Z",
+            "underlying_mid": 500.0,
+            "underlying_ts_utc": "2026-05-05T13:36:00Z",
+            "option_mid": 1.9,
+            "quote_age_ms": 100,
+        }),
+    ])
+
+    asyncio.run(worker.publish_window_assessments(df, "QQQ", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
+
+    audit = json.loads(worker.redis.values["nexus_strategy_audit:QQQ:etf_open_specialist:10:00"])
+    assert audit["kind"] == "nexus_strategy_decision_audit"
+    assert audit["decision"] == "NO_BET"
+    assert audit["sentiment"] == "CHOP"
+    assert audit["reason"] == "no_open_dominance"
+    assert audit["inputs"]["iv_rank"] == 22.0
+    assert audit["inputs"]["call_premium"] == 200_000.0
+    assert audit["inputs"]["put_premium"] == 190_000.0
+    assert audit["inputs"]["open_call_dominance_threshold"] == nw.OPEN_CALL_DOMINANCE
+    assert worker.redis.index_sets[nw.nexus_index_key(date(2026, 5, 5), "QQQ", "strategy_audit")]
+    assert any(fields["redis_key"] == "nexus_strategy_audit:QQQ:etf_open_specialist:10:00" for _, fields, _, _ in worker.redis.xadds)
+    assert ("signal:strategy_audit", json.dumps(audit)) in worker.redis.publishes
+
+
+def test_publish_window_assessments_audits_not_applicable_strategy_lanes():
+    worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
+    worker.redis = FakeRedis({
+        "options:live:vrp:IWM": json.dumps({"ivRank": 20, "asOf": "2026-05-05T14:05:00Z"}),
+        "options:live:iv_surface:IWM": json.dumps({"atmIv": 0.22, "asOf": "2026-05-05T14:05:00Z"}),
+        "options:live:gex:IWM": json.dumps({"netGex": 1_000_000, "asOf": "2026-05-05T14:05:00Z"}),
+    })
+    worker.strategy_audits_reported = set()
+    worker.window_views_reported = set()
+    worker.feature_blocks_reported = set()
+    worker.health_state = worker._empty_health_state()
+    worker._log = lambda *args, **kwargs: None
+    df = pl.DataFrame([
+        nw.normalize_trade_payload({
+            "symbol": "IWM",
+            "raw_symbol": "IWM   260505C00220000",
+            "ts_utc": "2026-05-05T13:35:00Z",
+            "side": "C",
+            "price": 2.0,
+            "size": 1000,
+            "premium": 200_000,
+            "is_sweep": False,
+            "aggressor": "A",
+            "delta": 0.50,
+            "gamma": 0.01,
+            "greeks_ts_utc": "2026-05-05T13:35:00Z",
+            "underlying_mid": 220.0,
+            "underlying_ts_utc": "2026-05-05T13:35:00Z",
+            "option_mid": 2.0,
+            "quote_age_ms": 100,
+        })
+    ])
+
+    asyncio.run(worker.publish_window_assessments(df, "IWM", nw.DECISION_SLOTS[0], datetime(2026, 5, 5).date()))
+
+    audit = json.loads(worker.redis.values["nexus_strategy_audit:IWM:etf_put_credit_open30_spread:10:00"])
+    assert audit["decision"] == "SKIPPED"
+    assert audit["reason"] == "strategy_not_applicable_to_symbol_or_window"
+    assert audit["inputs"]["total_premium"] == 200_000.0
+
+
 def test_publish_window_pricing_sets_key_and_side_summary():
     worker = nw.SigmatiqNexus.__new__(nw.SigmatiqNexus)
     worker.redis = FakeRedis()
